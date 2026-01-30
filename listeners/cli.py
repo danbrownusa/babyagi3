@@ -49,14 +49,16 @@ def setup_event_handlers(agent):
         )
 
 
-async def run_cli_listener(agent, config: dict = None):
+async def run_cli_listener(agent, config: dict = None, start_scheduler: bool = False):
     """Run the CLI listener.
 
     Args:
         agent: The Agent instance
         config: Optional configuration dict
+        start_scheduler: Whether to start the scheduler after greeting
     """
     config = config or {}
+    scheduler_task = None
 
     # Set up event handlers for verbose output
     setup_event_handlers(agent)
@@ -84,14 +86,22 @@ Be concise. Mention what you can help with based on available tools. If any tool
             max_tokens=200,
             messages=[{"role": "user", "content": greeting_prompt}]
         )
+        logger.info(f"API response received, content blocks: {len(greeting.content)}")
         greeting_text = "".join(b.text for b in greeting.content if hasattr(b, "text"))
-        logger.info(f"Greeting: {greeting_text}")
+        logger.info(f"Greeting extracted ({len(greeting_text)} chars): {greeting_text[:100]}...")
         console.system(f"\n{greeting_text}\n")
+        logger.info("Greeting printed to console")
     except Exception as e:
-        logger.error(f"Greeting generation failed: {e}")
+        logger.exception(f"Greeting generation failed: {e}")
         console.system("\nReady to assist. Type 'quit' to exit.\n")
     
-    logger.info("Ready for input - You: prompt displayed")
+    # Start scheduler AFTER greeting is displayed (so it doesn't block startup)
+    if start_scheduler:
+        logger.info("Starting scheduler...")
+        scheduler_task = asyncio.create_task(agent.run_scheduler())
+        logger.info("Scheduler started in background")
+    
+    logger.info("Entering REPL loop, displaying You: prompt")
 
     # Main REPL loop
     while True:

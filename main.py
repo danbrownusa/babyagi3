@@ -34,11 +34,12 @@ import sys
 
 from utils.console import console
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Configure logging with immediate stderr output
+handler = logging.StreamHandler(sys.stderr)
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logging.root.addHandler(handler)
+logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -90,15 +91,12 @@ async def run_cli_only():
     # Initialize agent
     agent = Agent(config=config)
 
-    # Start scheduler
-    scheduler_task = asyncio.create_task(agent.run_scheduler())
-
+    # Start CLI listener first (includes greeting), then start scheduler
+    # Scheduler is started inside the listener after greeting displays
     try:
-        await run_cli_listener(agent, config.get("channels", {}).get("cli", {}))
+        await run_cli_listener(agent, config.get("channels", {}).get("cli", {}), start_scheduler=True)
     except KeyboardInterrupt:
         console.system("\nGoodbye!")
-    finally:
-        scheduler_task.cancel()
 
 
 async def run_all_channels():
