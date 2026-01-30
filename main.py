@@ -38,6 +38,9 @@ from utils.console import console
 handler = logging.StreamHandler(sys.stderr)
 handler.setLevel(logging.INFO)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+
+# Suppress noisy library loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.root.addHandler(handler)
 logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
