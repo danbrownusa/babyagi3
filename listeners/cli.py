@@ -109,8 +109,11 @@ Be concise. Mention what you can help with based on available tools. If any tool
             # Print prompt to stderr for immediate visibility in workflow console
             import sys
             print(console.user_prompt(), end="", file=sys.stderr, flush=True)
+            logger.debug("Waiting for input...")
             user_input = await asyncio.to_thread(input)
+            logger.info(f"Raw input received: '{user_input}'")
             user_input = user_input.strip()
+            logger.info(f"Stripped input: '{user_input}'")
 
             # Check for verbose toggle commands
             if user_input.lower().startswith("/verbose"):
@@ -125,21 +128,30 @@ Be concise. Mention what you can help with based on available tools. If any tool
                 continue
 
             # Process through agent with CLI context
-            response = await agent.run_async(
-                user_input,
-                thread_id="main",
-                context={
-                    "channel": "cli",
-                    "is_owner": True,
-                }
-            )
-
-            console.agent(response)
+            logger.info(f"Processing user input: {user_input[:50]}...")
+            try:
+                response = await agent.run_async(
+                    user_input,
+                    thread_id="main",
+                    context={
+                        "channel": "cli",
+                        "is_owner": True,
+                    }
+                )
+                logger.info(f"Got response from agent ({len(response)} chars)")
+                console.agent(response)
+            except Exception as e:
+                logger.exception(f"Error processing message: {e}")
+                console.system(f"Error: {e}")
 
         except EOFError:
             # Handle Ctrl+D
             console.system("\nGoodbye!")
             break
+        except Exception as e:
+            # Catch any unexpected errors in the REPL loop
+            logger.exception(f"Unexpected error in REPL loop: {e}")
+            console.system(f"Unexpected error: {e}")
     
     # Cleanup scheduler task if running
     if scheduler_task:
