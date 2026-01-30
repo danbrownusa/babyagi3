@@ -6,8 +6,11 @@ Subscribes to agent events for verbose output display.
 """
 
 import asyncio
+import logging
 
 from utils.console import console
+
+logger = logging.getLogger(__name__)
 
 
 def setup_event_handlers(agent):
@@ -74,6 +77,7 @@ Tool Status:
 Be concise. Mention what you can help with based on available tools. If any tools need setup, briefly note it. End with an invitation to chat."""
 
     try:
+        logger.info("Generating greeting...")
         greeting = await asyncio.to_thread(
             agent.client.messages.create,
             model=agent.model,
@@ -81,16 +85,20 @@ Be concise. Mention what you can help with based on available tools. If any tool
             messages=[{"role": "user", "content": greeting_prompt}]
         )
         greeting_text = "".join(b.text for b in greeting.content if hasattr(b, "text"))
+        logger.info(f"Greeting: {greeting_text}")
         console.system(f"\n{greeting_text}\n")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Greeting generation failed: {e}")
         console.system("\nReady to assist. Type 'quit' to exit.\n")
+    
+    logger.info("Ready for input - You: prompt displayed")
 
     # Main REPL loop
     while True:
         try:
-            # Print prompt separately with flush, then read input
-            # This ensures the prompt appears even in buffered environments
-            print(console.user_prompt(), end="", flush=True)
+            # Print prompt to stderr for immediate visibility in workflow console
+            import sys
+            print(console.user_prompt(), end="", file=sys.stderr, flush=True)
             user_input = await asyncio.to_thread(input)
             user_input = user_input.strip()
 
