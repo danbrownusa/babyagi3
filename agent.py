@@ -23,68 +23,13 @@ from typing import Callable, Protocol, runtime_checkable
 
 import anthropic
 
-
-# =============================================================================
-# Thread-Safe Collections
-# =============================================================================
-
-class ThreadSafeList:
-    """Thread-safe list wrapper for concurrent access.
-
-    Provides safe iteration (via copy) and atomic operations.
-    Used for global shared state like MEMORIES and NOTES.
-    """
-
-    def __init__(self):
-        self._list: list = []
-        self._lock = threading.Lock()
-
-    def append(self, item):
-        """Thread-safe append."""
-        with self._lock:
-            self._list.append(item)
-
-    def pop(self, index: int = -1):
-        """Thread-safe pop."""
-        with self._lock:
-            return self._list.pop(index)
-
-    def __getitem__(self, index):
-        """Thread-safe index access."""
-        with self._lock:
-            return self._list[index]
-
-    def __setitem__(self, index, value):
-        """Thread-safe index assignment."""
-        with self._lock:
-            self._list[index] = value
-
-    def __len__(self):
-        """Thread-safe length."""
-        with self._lock:
-            return len(self._list)
-
-    def __iter__(self):
-        """Return iterator over a copy (safe for concurrent modification)."""
-        with self._lock:
-            return iter(self._list.copy())
-
-    def copy(self) -> list:
-        """Return a copy of the list."""
-        with self._lock:
-            return self._list.copy()
-
-    def __bool__(self):
-        """Thread-safe bool check."""
-        with self._lock:
-            return bool(self._list)
-
 from scheduler import (
     Scheduler, ScheduledTask, Schedule, SchedulerStore,
     create_task, parse_schedule, RunRecord
 )
 from utils.events import EventEmitter
 from utils.console import console, VerboseLevel
+from utils.collections import ThreadSafeList
 
 
 def json_serialize(obj):
@@ -367,22 +312,11 @@ class Agent(EventEmitter):
     def _initialize_memory(self):
         """Initialize the memory system with automatic SQLite setup.
 
-        Attempts to use the full SQLite-backed memory system with:
-        - Persistent storage in ~/.babyagi/memory/
-        - Semantic search via embeddings
-        - Entity and relationship extraction
-        - Pre-computed summaries
-
-        Falls back gracefully to simple in-memory storage if SQLite
-        initialization fails (missing dependencies, permissions, etc.).
-
-        Returns:
-            Memory instance if successful, None if using fallback.
+        Falls back gracefully to in-memory storage if SQLite fails.
+        Returns Memory instance if successful, None otherwise.
         """
-        from utils.console import console
         from pathlib import Path
 
-        # Check if memory is disabled in config
         memory_config = self.config.get("memory", {})
         if memory_config.get("enabled") is False:
             console.system("Memory: disabled (config)")
@@ -392,57 +326,41 @@ class Agent(EventEmitter):
             from memory import Memory
             from memory.integration import setup_memory_hooks
 
-            # Get custom path from config or use default
             store_path = memory_config.get("path", "~/.babyagi/memory")
-            expanded_path = Path(store_path).expanduser()
-            db_path = expanded_path / "memory.db"
-
-            # Check if we're loading existing or creating new
+            db_path = Path(store_path).expanduser() / "memory.db"
             is_new = not db_path.exists()
 
-            if is_new:
-                console.system("Memory: initializing SQLite database...")
-            else:
-                console.system("Memory: loading SQLite database...")
-
-            # Initialize memory - this auto-creates the directory and database
+            console.system(f"Memory: {'initializing' if is_new else 'loading'} SQLite database...")
             memory = Memory(store_path=store_path)
-
-            # Set up hooks to auto-log agent activity
             setup_memory_hooks(self, memory)
 
-            # Success message
-            if is_new:
-                console.success(f"Memory: created at {expanded_path}")
-            else:
-                # Get some stats about the loaded memory
-                try:
-                    event_count = memory.store._conn.execute(
-                        "SELECT COUNT(*) FROM events"
-                    ).fetchone()[0]
-                    console.success(f"Memory: loaded ({event_count} events)")
-                except Exception:
-                    console.success("Memory: loaded (SQLite persistent)")
-
+            self._log_memory_success(memory, db_path.parent, is_new)
             return memory
 
-        except ImportError as e:
-            # Missing dependencies (sqlite-vec, etc.)
-            console.warning(f"SQLite memory unavailable: {e}")
-            console.system("Memory: using in-memory storage (session only)")
+        except (ImportError, PermissionError, Exception) as e:
+            self._log_memory_fallback(e)
             return None
 
-        except PermissionError as e:
-            # Permission denied
-            console.error(f"Cannot access memory directory: {e}")
-            console.system("Memory: using in-memory storage (session only)")
-            return None
+    def _log_memory_success(self, memory, path, is_new: bool):
+        """Log successful memory initialization."""
+        if is_new:
+            console.success(f"Memory: created at {path}")
+        else:
+            try:
+                count = memory.store._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                console.success(f"Memory: loaded ({count} events)")
+            except Exception:
+                console.success("Memory: loaded (SQLite persistent)")
 
-        except Exception as e:
-            # Other errors (disk full, corruption, etc.)
-            console.error(f"Memory initialization failed: {e}")
-            console.system("Memory: using in-memory storage (session only)")
-            return None
+    def _log_memory_fallback(self, error: Exception):
+        """Log memory fallback due to error."""
+        if isinstance(error, ImportError):
+            console.warning(f"SQLite memory unavailable: {error}")
+        elif isinstance(error, PermissionError):
+            console.error(f"Cannot access memory directory: {error}")
+        else:
+            console.error(f"Memory initialization failed: {error}")
+        console.system("Memory: using in-memory storage (session only)")
 
     def _register_core_tools(self):
         """Register the built-in tools."""
@@ -467,8 +385,6 @@ class Agent(EventEmitter):
 
         Tools that fail to load are disabled rather than crashing.
         """
-        from utils.console import console
-
         if self.memory is None:
             return
 
@@ -601,9 +517,9 @@ print("RESULT:", json.dumps(result))
         import logging
         import traceback
         logger = logging.getLogger(__name__)
-        
+
         logger.info(f"[Scheduler] Starting task execution: {task.name} (id={task.id})")
-        
+
         # Emit task_start event
         self.emit("task_start", {
             "id": task.id,
@@ -901,38 +817,47 @@ Work autonomously. Use tools as needed. When done, provide a final summary."""
     # -------------------------------------------------------------------------
 
     def _system_prompt(self, thread_id: str = "main", is_owner: bool = True, context: dict = None) -> str:
-        """Generate context-aware system prompt.
-
-        Args:
-            thread_id: Current thread ID
-            is_owner: Whether message is from the agent's owner
-            context: Channel context with metadata
-        """
+        """Generate context-aware system prompt."""
         context = context or {}
+        base = self._build_base_prompt()
+        current_context = self._build_context_section(thread_id, is_owner, context)
+        return base + current_context
 
-        # Build objective status summary
-        obj_summary = ""
+    def _build_status_summaries(self) -> str:
+        """Build status summaries for objectives, tasks, and channels."""
+        parts = []
+
+        # Active objectives
         active = [o for o in self.objectives.values() if o.status in ("pending", "running")]
         if active:
-            obj_summary = "\n\nActive objectives:\n" + "\n".join(
+            parts.append("\n\nActive objectives:\n" + "\n".join(
                 f"- [{o.id[:8]}] {o.goal} ({o.status})" for o in active
-            )
+            ))
 
-        # Build available channels info
-        channels_info = ""
-        if self.senders:
-            channels_info = f"\n\nAvailable output channels: {', '.join(self.senders.keys())}"
-
-        # Build scheduled tasks summary
-        scheduled_summary = ""
-        scheduled_tasks = self.scheduler.list()
-        if scheduled_tasks:
-            scheduled_summary = "\n\nScheduled tasks:\n" + "\n".join(
+        # Scheduled tasks
+        tasks = self.scheduler.list()
+        if tasks:
+            parts.append("\n\nScheduled tasks:\n" + "\n".join(
                 f"- [{t.id}] {t.name}: {t.schedule.human_readable()} (next: {t.next_run_at[:16] if t.next_run_at else 'none'})"
-                for t in scheduled_tasks[:5]
-            )
+                for t in tasks[:5]
+            ))
 
-        base_prompt = f"""You are a helpful assistant with access to powerful tools.
+        # Available channels
+        if self.senders:
+            parts.append(f"\n\nAvailable output channels: {', '.join(self.senders.keys())}")
+
+        return "".join(parts)
+
+    def _build_base_prompt(self) -> str:
+        """Build the base capabilities prompt."""
+        status = self._build_status_summaries()
+
+        # Add tool inventory summary if available (for intelligent tool selection)
+        tool_inventory = ""
+        if self._current_tool_selection is not None:
+            tool_inventory = f"\n\n{self._current_tool_selection.tool_inventory_summary}"
+
+        return f"""You are a helpful assistant with access to powerful tools.
 
 CAPABILITIES:
 
@@ -953,7 +878,7 @@ CAPABILITIES:
 6. **Multi-Channel Communication**: Send messages via email, SMS, etc.
 
 7. **Register New Tools**: Extend capabilities at runtime with Python code.
-{obj_summary}{scheduled_summary}{channels_info}
+{status}{tool_inventory}
 
 WHEN TO USE SCHEDULING:
 
@@ -970,21 +895,13 @@ SCHEDULE EXAMPLES:
 - "Send daily standup at 9am" → schedule add, spec="daily at 9:00"
 - "Run report on weekdays at 6pm EST" → schedule add, spec={{"kind":"cron","cron":"0 18 * * 1-5","tz":"America/New_York"}}"""
 
-        # Add tool inventory summary if available
-        tool_inventory = ""
-        if self._current_tool_selection is not None:
-            tool_inventory = f"\n\n{self._current_tool_selection.tool_inventory_summary}"
+    def _build_context_section(self, thread_id: str, is_owner: bool, context: dict) -> str:
+        """Build the context-specific section of the prompt."""
+        channel = context.get("channel", "cli" if is_owner else "unknown")
+        verbose_info = f"- Verbose: {console.get_verbose().name.lower()} (use set_verbose tool to change)"
 
-        base_prompt = base_prompt + tool_inventory
-
-        # Get verbose status
-        verbose_level = console.get_verbose()
-        verbose_info = f"- Verbose: {verbose_level.name.lower()} (use set_verbose tool to change)"
-
-        # Add owner-specific or external-specific context
         if is_owner:
-            channel = context.get("channel", "cli")
-            return base_prompt + f"""
+            return f"""
 
 CURRENT CONTEXT:
 - Channel: {channel}
@@ -999,12 +916,9 @@ You are speaking with your owner. You have full access to:
 - Full context about their preferences and history
 
 Be helpful, proactive, and casual. You know them well."""
-        else:
-            # External message (not from owner)
-            sender = context.get("sender", "unknown")
-            channel = context.get("channel", "unknown")
 
-            return base_prompt + f"""
+        sender = context.get("sender", "unknown")
+        return f"""
 
 CURRENT CONTEXT:
 - Channel: {channel}
