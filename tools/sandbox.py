@@ -78,10 +78,10 @@ def get_sandbox():
     global _sandbox
     if _sandbox is None:
         from e2b_code_interpreter import Sandbox
-        api_key = os.getenv("E2B_API_KEY")
-        if not api_key:
+        # e2b reads API key from E2B_API_KEY environment variable automatically
+        if not os.getenv("E2B_API_KEY"):
             raise RuntimeError("E2B_API_KEY environment variable is not set")
-        _sandbox = Sandbox(api_key=api_key)
+        _sandbox = Sandbox()
     return _sandbox
 
 
