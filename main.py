@@ -91,14 +91,8 @@ async def run_cli_only():
         verbose_config = config.get("verbose", "off")
         console.set_verbose(verbose_config)
 
-    # Initialize agent
+    # Initialize agent (memory status is printed during initialization)
     agent = Agent(config=config)
-
-    # Show memory system status
-    if agent.memory is not None:
-        console.system("Memory: SQLite (persistent)")
-    else:
-        console.system("Memory: in-memory (session only)")
 
     # Start optional memory background tasks
     background_tasks = []
@@ -141,14 +135,8 @@ async def run_all_channels():
         verbose_config = config.get("verbose", "off")
         console.set_verbose(verbose_config)
 
-    # Initialize agent with config
+    # Initialize agent with config (memory status is printed during initialization)
     agent = Agent(config=config)
-
-    # Show memory system status
-    if agent.memory is not None:
-        console.system("Memory: SQLite (persistent)")
-    else:
-        console.system("Memory: in-memory (session only)")
 
     # Register senders for enabled channels
     _register_senders(agent, config)

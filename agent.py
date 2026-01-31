@@ -342,9 +342,13 @@ class Agent(EventEmitter):
         Returns:
             Memory instance if successful, None if using fallback.
         """
+        from utils.console import console
+        from pathlib import Path
+
         # Check if memory is disabled in config
         memory_config = self.config.get("memory", {})
         if memory_config.get("enabled") is False:
+            console.system("Memory: disabled (config)")
             return None
 
         try:
@@ -353,6 +357,16 @@ class Agent(EventEmitter):
 
             # Get custom path from config or use default
             store_path = memory_config.get("path", "~/.babyagi/memory")
+            expanded_path = Path(store_path).expanduser()
+            db_path = expanded_path / "memory.db"
+
+            # Check if we're loading existing or creating new
+            is_new = not db_path.exists()
+
+            if is_new:
+                console.system("Memory: initializing SQLite database...")
+            else:
+                console.system("Memory: loading SQLite database...")
 
             # Initialize memory - this auto-creates the directory and database
             memory = Memory(store_path=store_path)
@@ -360,22 +374,37 @@ class Agent(EventEmitter):
             # Set up hooks to auto-log agent activity
             setup_memory_hooks(self, memory)
 
+            # Success message
+            if is_new:
+                console.success(f"Memory: created at {expanded_path}")
+            else:
+                # Get some stats about the loaded memory
+                try:
+                    event_count = memory.store._conn.execute(
+                        "SELECT COUNT(*) FROM events"
+                    ).fetchone()[0]
+                    console.success(f"Memory: loaded ({event_count} events)")
+                except Exception:
+                    console.success("Memory: loaded (SQLite persistent)")
+
             return memory
 
         except ImportError as e:
             # Missing dependencies (sqlite-vec, etc.)
-            import logging
-            logging.getLogger(__name__).info(
-                f"SQLite memory unavailable ({e}), using simple in-memory storage"
-            )
+            console.warning(f"SQLite memory unavailable: {e}")
+            console.system("Memory: using in-memory storage (session only)")
             return None
+
+        except PermissionError as e:
+            # Permission denied
+            console.error(f"Cannot access memory directory: {e}")
+            console.system("Memory: using in-memory storage (session only)")
+            return None
+
         except Exception as e:
-            # Permission errors, disk full, etc.
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Could not initialize SQLite memory: {e}. "
-                "Using simple in-memory storage (memories won't persist)."
-            )
+            # Other errors (disk full, corruption, etc.)
+            console.error(f"Memory initialization failed: {e}")
+            console.system("Memory: using in-memory storage (session only)")
             return None
 
     def _register_core_tools(self):
