@@ -244,6 +244,9 @@ class Agent(EventEmitter):
         # Scheduler for recurring and one-time tasks
         self.scheduler = Scheduler(executor=self._execute_scheduled_task)
 
+        # Memory system - try SQLite, gracefully fall back to in-memory
+        self.memory = self._initialize_memory()
+
         # Register core tools
         self._register_core_tools()
 
@@ -324,9 +327,66 @@ class Agent(EventEmitter):
             f"Verify 'name' is str, 'fn' is callable, and 'schema' is dict."
         )
 
+    def _initialize_memory(self):
+        """Initialize the memory system with automatic SQLite setup.
+
+        Attempts to use the full SQLite-backed memory system with:
+        - Persistent storage in ~/.babyagi/memory/
+        - Semantic search via embeddings
+        - Entity and relationship extraction
+        - Pre-computed summaries
+
+        Falls back gracefully to simple in-memory storage if SQLite
+        initialization fails (missing dependencies, permissions, etc.).
+
+        Returns:
+            Memory instance if successful, None if using fallback.
+        """
+        # Check if memory is disabled in config
+        memory_config = self.config.get("memory", {})
+        if memory_config.get("enabled") is False:
+            return None
+
+        try:
+            from memory import Memory
+            from memory.integration import setup_memory_hooks
+
+            # Get custom path from config or use default
+            store_path = memory_config.get("path", "~/.babyagi/memory")
+
+            # Initialize memory - this auto-creates the directory and database
+            memory = Memory(store_path=store_path)
+
+            # Set up hooks to auto-log agent activity
+            setup_memory_hooks(self, memory)
+
+            return memory
+
+        except ImportError as e:
+            # Missing dependencies (sqlite-vec, etc.)
+            import logging
+            logging.getLogger(__name__).info(
+                f"SQLite memory unavailable ({e}), using simple in-memory storage"
+            )
+            return None
+        except Exception as e:
+            # Permission errors, disk full, etc.
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Could not initialize SQLite memory: {e}. "
+                "Using simple in-memory storage (memories won't persist)."
+            )
+            return None
+
     def _register_core_tools(self):
         """Register the built-in tools."""
-        self.register(_memory_tool(self))
+        # Use enhanced memory tool if SQLite memory is available
+        if self.memory is not None:
+            from memory.integration import create_enhanced_memory_tool
+            self.register(create_enhanced_memory_tool(self.memory))
+        else:
+            self.register(_memory_tool(self))
+
         self.register(_objective_tool(self))
         self.register(_notes_tool(self))
         self.register(_schedule_tool(self))
