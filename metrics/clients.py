@@ -218,8 +218,124 @@ class InstrumentedAsyncAnthropic:
 
 
 # ═══════════════════════════════════════════════════════════
-# INSTRUMENTED OPENAI CLIENT (for Embeddings)
+# INSTRUMENTED OPENAI CLIENT
 # ═══════════════════════════════════════════════════════════
+
+
+class InstrumentedChatCompletions:
+    """
+    Wrapper for openai.OpenAI().chat.completions that tracks calls.
+
+    Transparently intercepts create() calls to emit metrics events.
+    """
+
+    def __init__(self, completions):
+        self._completions = completions
+
+    def create(self, **kwargs) -> Any:
+        """Instrumented chat.completions.create() call."""
+        start_time = time.time()
+
+        # Make the actual API call
+        response = self._completions.create(**kwargs)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Extract metrics
+        model = kwargs.get("model", "gpt-4o")
+        input_tokens = response.usage.prompt_tokens if response.usage else 0
+        output_tokens = response.usage.completion_tokens if response.usage else 0
+        cost = calculate_cost(model, input_tokens, output_tokens)
+
+        # Determine stop reason
+        stop_reason = "unknown"
+        if response.choices:
+            stop_reason = response.choices[0].finish_reason or "unknown"
+
+        # Emit event
+        if _event_emitter:
+            _event_emitter.emit("llm_call_end", {
+                "provider": "openai",
+                "source": _current_source,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "duration_ms": duration_ms,
+                "stop_reason": stop_reason,
+            })
+
+        return response
+
+
+class InstrumentedAsyncChatCompletions:
+    """
+    Async wrapper for openai.AsyncOpenAI().chat.completions.
+
+    Same as InstrumentedChatCompletions but for async clients.
+    """
+
+    def __init__(self, completions):
+        self._completions = completions
+
+    async def create(self, **kwargs) -> Any:
+        """Instrumented async chat.completions.create() call."""
+        start_time = time.time()
+
+        # Make the actual API call
+        response = await self._completions.create(**kwargs)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Extract metrics
+        model = kwargs.get("model", "gpt-4o")
+        input_tokens = response.usage.prompt_tokens if response.usage else 0
+        output_tokens = response.usage.completion_tokens if response.usage else 0
+        cost = calculate_cost(model, input_tokens, output_tokens)
+
+        # Determine stop reason
+        stop_reason = "unknown"
+        if response.choices:
+            stop_reason = response.choices[0].finish_reason or "unknown"
+
+        # Emit event
+        if _event_emitter:
+            _event_emitter.emit("llm_call_end", {
+                "provider": "openai",
+                "source": _current_source,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "duration_ms": duration_ms,
+                "stop_reason": stop_reason,
+            })
+
+        return response
+
+
+class InstrumentedChat:
+    """Wrapper for openai.OpenAI().chat namespace."""
+
+    def __init__(self, chat):
+        self._chat = chat
+        self._completions = InstrumentedChatCompletions(chat.completions)
+
+    @property
+    def completions(self):
+        return self._completions
+
+
+class InstrumentedAsyncChat:
+    """Wrapper for openai.AsyncOpenAI().chat namespace."""
+
+    def __init__(self, chat):
+        self._chat = chat
+        self._completions = InstrumentedAsyncChatCompletions(chat.completions)
+
+    @property
+    def completions(self):
+        return self._completions
 
 
 class InstrumentedEmbeddings:
@@ -273,7 +389,7 @@ class InstrumentedOpenAI:
     """
     Drop-in replacement for openai.OpenAI with automatic metrics.
 
-    Currently only instruments the embeddings API.
+    Instruments both chat completions and embeddings APIs.
 
     Usage:
         # Instead of:
@@ -283,17 +399,44 @@ class InstrumentedOpenAI:
         client = InstrumentedOpenAI()
 
         # Everything else works the same
-        response = client.embeddings.create(...)
+        response = client.chat.completions.create(...)
+        embeddings = client.embeddings.create(...)
     """
 
     def __init__(self, **kwargs):
         from openai import OpenAI
         self._client = OpenAI(**kwargs)
+        self._chat = InstrumentedChat(self._client.chat)
         self._embeddings = InstrumentedEmbeddings(self._client.embeddings)
+
+    @property
+    def chat(self):
+        return self._chat
 
     @property
     def embeddings(self):
         return self._embeddings
+
+
+class InstrumentedAsyncOpenAI:
+    """
+    Drop-in replacement for openai.AsyncOpenAI with automatic metrics.
+
+    Instruments both chat completions and embeddings APIs.
+
+    Usage:
+        client = InstrumentedAsyncOpenAI()
+        response = await client.chat.completions.create(...)
+    """
+
+    def __init__(self, **kwargs):
+        from openai import AsyncOpenAI
+        self._client = AsyncOpenAI(**kwargs)
+        self._chat = InstrumentedAsyncChat(self._client.chat)
+
+    @property
+    def chat(self):
+        return self._chat
 
 
 # ═══════════════════════════════════════════════════════════
