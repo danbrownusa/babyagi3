@@ -22,10 +22,28 @@ This plan describes an elegant, minimalist approach to adding comprehensive metr
 | Feature | Impact |
 |---------|--------|
 | **AI/LLM Call Tracking** | No token counts, costs, or latency for Claude API calls |
+| **Embedding Call Tracking** | No tracking of OpenAI/Voyage embedding API calls |
+| **Memory System Call Tracking** | Extraction, summarization, and retrieval use Claude but aren't tracked |
 | **Cost Calculation** | No infrastructure to calculate $ costs from tokens |
 | **Session Metrics** | No per-session/thread aggregation |
 | **Unified Query Interface** | Metrics scattered, no easy summary access |
 | **Agent Introspection Tools** | Agent can't query its own performance |
+
+### All API Call Locations (Complete Inventory)
+
+| Component | File | Method | Model/API | Purpose |
+|-----------|------|--------|-----------|---------|
+| **Main Agent Loop** | `agent.py:771` | `run_async()` | Claude Sonnet | Primary agent reasoning |
+| **Embeddings** | `memory/embeddings.py:234` | `OpenAIEmbeddings.embed()` | OpenAI text-embedding-3-small | Semantic vectors |
+| **Embeddings** | `memory/embeddings.py:271` | `OpenAIEmbeddings.embed_batch()` | OpenAI text-embedding-3-small | Batch vectors |
+| **Embeddings** | `memory/embeddings.py:304` | `AnthropicVoyageEmbeddings.embed()` | Voyage voyage-2 | Alt embeddings |
+| **Extraction** | `memory/extraction.py:269` | `_llm_extract()` | Claude Sonnet | Entity/relationship extraction |
+| **Extraction** | `memory/extraction.py:495` | `_cluster_entity_type_llm()` | Claude Haiku | Type classification |
+| **Extraction** | `memory/extraction.py:541` | `_cluster_relation_type_llm()` | Claude Haiku | Relation classification |
+| **Summaries** | `memory/summaries.py:263` | `_refresh_leaf_node()` | Claude Sonnet | Entity/topic summaries |
+| **Summaries** | `memory/summaries.py:314` | `_refresh_branch_node()` | Claude Sonnet | Category synthesis |
+| **Summaries** | `memory/summaries.py:367` | `_refresh_root_node()` | Claude Sonnet | High-level overview |
+| **Deep Retrieval** | `memory/retrieval.py:811` | `DeepRetrievalAgent.run()` | Claude Sonnet | Agentic memory search |
 
 ---
 
@@ -42,60 +60,429 @@ This plan describes an elegant, minimalist approach to adding comprehensive metr
 ### Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Agent (agent.py)                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────┐    emit()    ┌──────────────────────────────┐ │
-│  │ run_async() │─────────────▶│       EventEmitter           │ │
-│  │             │              │  • ai_call_start (NEW)       │ │
-│  │ Claude API  │              │  • ai_call_end (NEW)         │ │
-│  │ Tool Exec   │              │  • tool_start                │ │
-│  └─────────────┘              │  • tool_end                  │ │
-│                               └──────────────┬───────────────┘ │
-└──────────────────────────────────────────────│─────────────────┘
-                                               │
-                                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   MetricsCollector (NEW)                         │
-│                   metrics/collector.py                           │
-├──────────────────────────────────────────────────────────────────┤
-│  • Subscribes to all metric-relevant events                      │
-│  • Tracks in-flight operations (for latency calculation)         │
-│  • Stores to SQLite via memory.store                             │
-│  • Provides query methods for aggregation                        │
-└──────────────────────────────────────────────┬───────────────────┘
-                                               │
-                                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   SQLite (Extended Schema)                       │
-│                   memory/store.py                                │
-├──────────────────────────────────────────────────────────────────┤
-│  NEW TABLES:                                                     │
-│  • ai_calls: model, tokens_in, tokens_out, cost, latency_ms      │
-│  • metrics_snapshots: periodic aggregated snapshots              │
-│                                                                  │
-│  EXTENDED:                                                       │
-│  • events: add session_id column for grouping                    │
-└──────────────────────────────────────────────────────────────────┘
-                                               │
-                                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   Agent Tools (NEW)                              │
-│                   tools/metrics.py                               │
-├──────────────────────────────────────────────────────────────────┤
-│  get_metrics(action, ...)                                        │
-│  • "summary" - Overall performance summary                       │
-│  • "costs" - Cost breakdown by model/period                      │
-│  • "tools" - Tool performance stats                              │
-│  • "session" - Current session metrics                           │
-│  • "slow_operations" - Identify bottlenecks                      │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ALL API CALL SOURCES                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────┐  │
+│  │   Agent Loop     │  │  Memory System   │  │      Embeddings          │  │
+│  │   (agent.py)     │  │                  │  │  (memory/embeddings.py)  │  │
+│  │                  │  │  ┌────────────┐  │  │                          │  │
+│  │  run_async()     │  │  │ Extraction │  │  │  OpenAI embed()          │  │
+│  │  Claude Sonnet   │  │  │ Claude     │  │  │  Voyage embed()          │  │
+│  │                  │  │  └────────────┘  │  │                          │  │
+│  │  Tool Execution  │  │  ┌────────────┐  │  └──────────────────────────┘  │
+│  │                  │  │  │ Summaries  │  │                                │
+│  └────────┬─────────┘  │  │ Claude     │  │                                │
+│           │            │  └────────────┘  │                                │
+│           │            │  ┌────────────┐  │                                │
+│           │            │  │ Retrieval  │  │                                │
+│           │            │  │ Claude     │  │                                │
+│           │            │  └────────────┘  │                                │
+│           │            └────────┬─────────┘                                │
+│           │                     │                                          │
+│           └──────────┬──────────┘                                          │
+│                      ▼                                                     │
+│         ┌────────────────────────────────────────┐                         │
+│         │         Instrumented API Client        │◀─── Key Innovation     │
+│         │         (metrics/client.py)            │                         │
+│         ├────────────────────────────────────────┤                         │
+│         │  Wraps Anthropic/OpenAI clients        │                         │
+│         │  Emits events for ALL API calls        │                         │
+│         │  Tracks tokens, latency, cost          │                         │
+│         │  Zero changes to calling code          │                         │
+│         └────────────────┬───────────────────────┘                         │
+│                          │ emit()                                          │
+│                          ▼                                                 │
+│         ┌────────────────────────────────────────┐                         │
+│         │           EventEmitter                 │                         │
+│         │  • llm_call_start / llm_call_end       │                         │
+│         │  • embedding_call_start / end          │                         │
+│         │  • tool_start / tool_end               │                         │
+│         └────────────────┬───────────────────────┘                         │
+└──────────────────────────│─────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        MetricsCollector (NEW)                                │
+│                        metrics/collector.py                                  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  • Subscribes to ALL metric events                                           │
+│  • Categorizes by source: agent, extraction, summary, retrieval, embedding   │
+│  • Stores to SQLite via memory.store                                         │
+│  • Provides rich query/aggregation methods                                   │
+└──────────────────────────┬───────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        SQLite (Extended Schema)                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  NEW TABLES:                                                                 │
+│  • llm_calls: source, model, tokens_in, tokens_out, cost, latency_ms         │
+│  • embedding_calls: provider, model, text_count, latency_ms, cached          │
+│  • session_metrics: aggregated per-thread stats                              │
+└──────────────────────────┬───────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Agent Tools (NEW)                                     │
+│                        tools/metrics.py                                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│  get_metrics(action, ...)                                                    │
+│  • "summary" - Overall performance summary                                   │
+│  • "costs" - Cost breakdown by model/source/period                           │
+│  • "tools" - Tool performance stats                                          │
+│  • "memory" - Memory system costs (extraction, summaries, retrieval)         │
+│  • "embeddings" - Embedding API usage and cache hit rates                    │
+│  • "session" - Current session metrics                                       │
+│  • "slow" - Identify bottlenecks                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Key Design Decision: Instrumented Client Wrapper
+
+Instead of modifying every file that makes API calls, we create **wrapper clients** that automatically track all calls. This is the most elegant approach because:
+
+1. **Zero changes to existing code** - Just swap the client at initialization
+2. **Impossible to miss calls** - All API traffic goes through the wrapper
+3. **Single point of control** - Easy to add new metrics later
+4. **Transparent** - Calling code doesn't know it's being tracked
 
 ---
 
 ## Implementation Plan
+
+### Phase 0: Instrumented Client Wrappers (Foundation)
+
+The most elegant approach is to create wrapper clients that transparently track all API calls. This requires minimal changes to existing code.
+
+#### 0.1 Instrumented Anthropic Client
+
+**File**: `metrics/clients.py` (NEW)
+
+```python
+"""
+Instrumented API clients that automatically track all calls.
+
+These wrappers are transparent - calling code doesn't know it's being tracked.
+"""
+
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+from functools import wraps
+
+import anthropic
+
+from .costs import calculate_cost
+
+
+@dataclass
+class LLMCallEvent:
+    """Event data for an LLM API call."""
+    source: str  # "agent", "extraction", "summary", "retrieval"
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    duration_ms: int
+    stop_reason: str
+    metadata: dict | None = None
+
+
+# Global event emitter reference (set during initialization)
+_event_emitter = None
+_current_source = "unknown"  # Context for categorizing calls
+
+
+def set_event_emitter(emitter):
+    """Set the global event emitter for metrics."""
+    global _event_emitter
+    _event_emitter = emitter
+
+
+def set_call_source(source: str):
+    """Set the current call source context."""
+    global _current_source
+    _current_source = source
+
+
+class InstrumentedMessages:
+    """Wrapper for anthropic.Anthropic().messages that tracks calls."""
+
+    def __init__(self, messages, source: str = "unknown"):
+        self._messages = messages
+        self._source = source
+
+    def create(self, **kwargs) -> Any:
+        """Instrumented messages.create() call."""
+        start_time = time.time()
+
+        # Make the actual API call
+        response = self._messages.create(**kwargs)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Extract metrics
+        model = kwargs.get("model", "unknown")
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        cost = calculate_cost(model, input_tokens, output_tokens)
+
+        # Emit event
+        if _event_emitter:
+            _event_emitter.emit("llm_call_end", {
+                "source": _current_source,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "duration_ms": duration_ms,
+                "stop_reason": response.stop_reason,
+            })
+
+        return response
+
+
+class InstrumentedAsyncMessages:
+    """Async wrapper for anthropic.AsyncAnthropic().messages."""
+
+    def __init__(self, messages, source: str = "unknown"):
+        self._messages = messages
+        self._source = source
+
+    async def create(self, **kwargs) -> Any:
+        """Instrumented async messages.create() call."""
+        start_time = time.time()
+
+        # Make the actual API call
+        response = await self._messages.create(**kwargs)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Extract metrics
+        model = kwargs.get("model", "unknown")
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        cost = calculate_cost(model, input_tokens, output_tokens)
+
+        # Emit event
+        if _event_emitter:
+            _event_emitter.emit("llm_call_end", {
+                "source": _current_source,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "duration_ms": duration_ms,
+                "stop_reason": response.stop_reason,
+            })
+
+        return response
+
+
+class InstrumentedAnthropic:
+    """
+    Drop-in replacement for anthropic.Anthropic with automatic metrics.
+
+    Usage:
+        # Instead of:
+        client = anthropic.Anthropic()
+
+        # Use:
+        client = InstrumentedAnthropic()
+
+        # Everything else works the same
+        response = client.messages.create(...)
+    """
+
+    def __init__(self, **kwargs):
+        self._client = anthropic.Anthropic(**kwargs)
+        self._messages = InstrumentedMessages(self._client.messages)
+
+    @property
+    def messages(self):
+        return self._messages
+
+
+class InstrumentedAsyncAnthropic:
+    """Async version of InstrumentedAnthropic."""
+
+    def __init__(self, **kwargs):
+        self._client = anthropic.AsyncAnthropic(**kwargs)
+        self._messages = InstrumentedAsyncMessages(self._client.messages)
+
+    @property
+    def messages(self):
+        return self._messages
+```
+
+#### 0.2 Instrumented OpenAI Client (for Embeddings)
+
+**Add to**: `metrics/clients.py`
+
+```python
+from openai import OpenAI
+
+# Embedding pricing per 1M tokens
+EMBEDDING_PRICING = {
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+    "text-embedding-ada-002": 0.10,
+}
+
+
+class InstrumentedEmbeddings:
+    """Wrapper for openai.OpenAI().embeddings that tracks calls."""
+
+    def __init__(self, embeddings):
+        self._embeddings = embeddings
+
+    def create(self, **kwargs) -> Any:
+        """Instrumented embeddings.create() call."""
+        start_time = time.time()
+
+        # Make the actual API call
+        response = self._embeddings.create(**kwargs)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Calculate cost
+        model = kwargs.get("model", "text-embedding-3-small")
+        input_text = kwargs.get("input", "")
+        if isinstance(input_text, list):
+            text_count = len(input_text)
+            # Rough token estimate: ~4 chars per token
+            token_estimate = sum(len(t) // 4 for t in input_text)
+        else:
+            text_count = 1
+            token_estimate = len(input_text) // 4
+
+        price_per_million = EMBEDDING_PRICING.get(model, 0.02)
+        cost = (token_estimate / 1_000_000) * price_per_million
+
+        # Emit event
+        if _event_emitter:
+            _event_emitter.emit("embedding_call_end", {
+                "provider": "openai",
+                "model": model,
+                "text_count": text_count,
+                "token_estimate": token_estimate,
+                "cost_usd": cost,
+                "duration_ms": duration_ms,
+                "cached": False,
+            })
+
+        return response
+
+
+class InstrumentedOpenAI:
+    """Drop-in replacement for openai.OpenAI with automatic metrics."""
+
+    def __init__(self, **kwargs):
+        self._client = OpenAI(**kwargs)
+        self._embeddings = InstrumentedEmbeddings(self._client.embeddings)
+
+    @property
+    def embeddings(self):
+        return self._embeddings
+```
+
+#### 0.3 Context Manager for Call Source
+
+**Add to**: `metrics/clients.py`
+
+```python
+from contextlib import contextmanager
+
+
+@contextmanager
+def track_source(source: str):
+    """
+    Context manager to set the source of API calls.
+
+    Usage:
+        with track_source("extraction"):
+            # All LLM calls in this block are tagged as "extraction"
+            response = client.messages.create(...)
+    """
+    global _current_source
+    previous = _current_source
+    _current_source = source
+    try:
+        yield
+    finally:
+        _current_source = previous
+```
+
+#### 0.4 Integration Points
+
+**Minimal changes required**:
+
+1. **agent.py** (line ~167):
+   ```python
+   # Before:
+   self.client = anthropic.AsyncAnthropic()
+
+   # After:
+   from metrics.clients import InstrumentedAsyncAnthropic, set_event_emitter
+   self.client = InstrumentedAsyncAnthropic()
+   set_event_emitter(self)  # Agent is an EventEmitter
+   ```
+
+2. **memory/extraction.py** (line ~57):
+   ```python
+   # Before:
+   self._client = anthropic.Anthropic()
+
+   # After:
+   from metrics.clients import InstrumentedAnthropic, track_source
+   self._client = InstrumentedAnthropic()
+
+   # In _llm_extract:
+   with track_source("extraction"):
+       response = self.client.messages.create(...)
+   ```
+
+3. **memory/summaries.py** (line ~149):
+   ```python
+   # Before:
+   self._client = anthropic.Anthropic()
+
+   # After:
+   from metrics.clients import InstrumentedAnthropic, track_source
+   self._client = InstrumentedAnthropic()
+
+   # In refresh methods:
+   with track_source("summary"):
+       response = self.client.messages.create(...)
+   ```
+
+4. **memory/retrieval.py** (line ~458):
+   ```python
+   # Before:
+   self._client = anthropic.Anthropic()
+
+   # After:
+   from metrics.clients import InstrumentedAnthropic, track_source
+   self._client = InstrumentedAnthropic()
+
+   # In run():
+   with track_source("retrieval"):
+       response = self.client.messages.create(...)
+   ```
+
+5. **memory/embeddings.py** (line ~215):
+   ```python
+   # Before:
+   self._client = OpenAI()
+
+   # After:
+   from metrics.clients import InstrumentedOpenAI
+   self._client = InstrumentedOpenAI()
+   ```
+
+---
 
 ### Phase 1: Core Infrastructure
 
@@ -256,11 +643,21 @@ MODEL_PRICING = {
     # Claude 3.5
     "claude-3-5-sonnet-20241022": (3.00, 15.00),
     "claude-3-5-haiku-20241022": (0.80, 4.00),
+    "claude-haiku-3-5-20241022": (0.80, 4.00),  # Alternate name
 
     # Claude 3
     "claude-3-opus-20240229": (15.00, 75.00),
     "claude-3-sonnet-20240229": (3.00, 15.00),
     "claude-3-haiku-20240307": (0.25, 1.25),
+}
+
+# Embedding pricing per 1M tokens
+EMBEDDING_PRICING = {
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+    "text-embedding-ada-002": 0.10,
+    "voyage-2": 0.10,
+    "voyage-large-2": 0.12,
 }
 
 # Default fallback for unknown models
@@ -661,24 +1058,29 @@ from tools import tool
 def get_metrics(
     action: str,
     period: str = "day",
+    source: str = None,
     tool_name: str = None,
     thread_id: str = None,
     limit: int = 10,
 ) -> dict:
     """
-    Query performance metrics and costs.
+    Query performance metrics and costs across all system components.
 
     Actions:
     - "summary": Overall performance summary for the period
-    - "costs": Cost breakdown by model and usage
+    - "costs": Cost breakdown by model, source, and usage
     - "tools": Tool performance statistics
+    - "memory": Memory system costs (extraction, summaries, retrieval, embeddings)
+    - "embeddings": Embedding API usage and cache hit rates
     - "session": Metrics for a specific session/thread
     - "slow": Find slow operations (bottlenecks)
     - "errors": Recent errors and failure patterns
+    - "by_source": Breakdown by source (agent, extraction, summary, retrieval)
 
     Args:
         action: What metrics to retrieve
         period: Time period - "hour", "day", "week", "month", "all"
+        source: Filter by source - "agent", "extraction", "summary", "retrieval", "embedding"
         tool_name: Filter to specific tool (for "tools" action)
         thread_id: Session ID (for "session" action)
         limit: Max results for list actions
@@ -689,6 +1091,8 @@ def get_metrics(
     Examples:
         get_metrics(action="summary")
         get_metrics(action="costs", period="week")
+        get_metrics(action="memory")  # See memory system costs
+        get_metrics(action="by_source")  # Breakdown by component
         get_metrics(action="tools", tool_name="web_search")
         get_metrics(action="slow", limit=5)
     """
@@ -792,6 +1196,65 @@ def get_metrics(
             "error_counts_by_tool": collector.get_error_counts(),
         }
 
+    elif action == "memory":
+        # Memory system breakdown (extraction, summaries, retrieval, embeddings)
+        memory_stats = collector.get_memory_system_metrics(period=period)
+        return {
+            "period": period,
+            "extraction": {
+                "calls": memory_stats["extraction"]["call_count"],
+                "cost": f"${memory_stats['extraction']['cost']:.4f}",
+                "avg_latency_ms": memory_stats["extraction"]["avg_latency_ms"],
+            },
+            "summaries": {
+                "calls": memory_stats["summary"]["call_count"],
+                "cost": f"${memory_stats['summary']['cost']:.4f}",
+                "avg_latency_ms": memory_stats["summary"]["avg_latency_ms"],
+            },
+            "retrieval": {
+                "calls": memory_stats["retrieval"]["call_count"],
+                "cost": f"${memory_stats['retrieval']['cost']:.4f}",
+                "avg_latency_ms": memory_stats["retrieval"]["avg_latency_ms"],
+            },
+            "embeddings": {
+                "calls": memory_stats["embedding"]["call_count"],
+                "cost": f"${memory_stats['embedding']['cost']:.4f}",
+                "cache_hit_rate": f"{memory_stats['embedding']['cache_hit_rate']:.1f}%",
+            },
+            "total_memory_cost": f"${memory_stats['total_cost']:.4f}",
+        }
+
+    elif action == "embeddings":
+        # Detailed embedding stats
+        embed_stats = collector.get_embedding_metrics(period=period)
+        return {
+            "period": period,
+            "total_calls": embed_stats["call_count"],
+            "total_texts_embedded": embed_stats["text_count"],
+            "cache_hit_rate": f"{embed_stats['cache_hit_rate']:.1f}%",
+            "cost": f"${embed_stats['cost']:.4f}",
+            "avg_latency_ms": embed_stats["avg_latency_ms"],
+            "by_model": embed_stats.get("by_model", {}),
+        }
+
+    elif action == "by_source":
+        # Breakdown by source (agent, extraction, summary, retrieval)
+        source_stats = collector.get_metrics_by_source(period=period)
+        return {
+            "period": period,
+            "sources": {
+                name: {
+                    "calls": stats["call_count"],
+                    "tokens": stats["total_tokens"],
+                    "cost": f"${stats['cost']:.4f}",
+                    "avg_latency_ms": round(stats["avg_latency_ms"], 1),
+                    "pct_of_total_cost": f"{stats['cost_pct']:.1f}%",
+                }
+                for name, stats in source_stats.items()
+            },
+            "total_cost": f"${sum(s['cost'] for s in source_stats.values()):.4f}",
+        }
+
     return {"error": f"Unknown action: {action}"}
 ```
 
@@ -872,18 +1335,26 @@ def setup_memory_hooks(agent, memory):
 ```
 metrics/
 ├── __init__.py       # Package exports
-├── models.py         # Data models (AICallMetric, ToolMetric, etc.)
-├── costs.py          # Token cost calculation
+├── clients.py        # InstrumentedAnthropic, InstrumentedOpenAI (KEY FILE)
+├── models.py         # Data models (LLMCallMetric, EmbeddingCallMetric, etc.)
+├── costs.py          # Token/embedding cost calculation for all providers
 └── collector.py      # MetricsCollector class
 
 tools/
-└── metrics.py        # get_metrics tool
+└── metrics.py        # get_metrics tool (agent introspection)
 
 memory/
-└── store.py          # Extended with metrics tables and queries
+├── store.py          # Extended with metrics tables and queries
+├── extraction.py     # Modified: use InstrumentedAnthropic + track_source
+├── summaries.py      # Modified: use InstrumentedAnthropic + track_source
+├── retrieval.py      # Modified: use InstrumentedAnthropic + track_source
+└── embeddings.py     # Modified: use InstrumentedOpenAI
 
-agent.py              # Modified to emit ai_call_start/end events
+agent.py              # Modified: use InstrumentedAsyncAnthropic
 ```
+
+**Total new code**: ~700 lines
+**Modified lines**: ~30 lines (just client swaps and track_source wraps)
 
 ---
 
@@ -891,18 +1362,35 @@ agent.py              # Modified to emit ai_call_start/end events
 
 ### Agent Self-Introspection
 
-The agent can now understand its own performance:
+The agent can now understand its own performance across ALL components:
 
 ```
 User: How much have you cost me today?
 
 Agent: Let me check my metrics.
-[Calls get_metrics(action="costs", period="day")]
+[Calls get_metrics(action="summary", period="day")]
 
-Agent: Today I've made 47 API calls totaling $0.2341:
-- claude-sonnet-4: $0.1892 (42 calls)
-- claude-opus-4: $0.0449 (5 calls)
-Average cost per call: $0.0050
+Agent: Today's usage across all systems:
+- Total cost: $0.4521
+- 47 agent LLM calls: $0.2341
+- 12 memory extraction calls: $0.0892
+- 8 summary refresh calls: $0.0634
+- 3 deep retrieval searches: $0.0412
+- 156 embedding calls: $0.0242
+Average cost per agent call: $0.0050
+```
+
+```
+User: What's my memory system costing me?
+
+Agent: [Calls get_metrics(action="memory", period="week")]
+
+Agent: Memory system costs this week:
+- Extraction (entity/relationship): $2.34 (89 calls)
+- Summary generation: $1.87 (42 refreshes)
+- Deep retrieval: $0.92 (18 searches)
+- Embeddings: $0.31 (1,234 texts, 94% cache hit rate)
+Total memory overhead: $5.44 (23% of total spend)
 ```
 
 ```
@@ -912,8 +1400,22 @@ Agent: [Calls get_metrics(action="slow")]
 
 Agent: The slowest operations today:
 1. browse_url: 12,450ms - navigating to complex page
-2. web_search: 8,234ms - rate limited
-3. execute_code: 6,120ms - running analysis script
+2. deep_retrieval: 8,890ms - complex memory search
+3. web_search: 8,234ms - rate limited
+4. summary_refresh: 6,120ms - refreshing root node
+```
+
+```
+User: Show me cost breakdown by component
+
+Agent: [Calls get_metrics(action="by_source")]
+
+Agent: Cost breakdown by source:
+- Agent (main reasoning): $0.23 (51% of total)
+- Extraction (NLP): $0.11 (24%)
+- Summaries: $0.07 (15%)
+- Retrieval: $0.03 (7%)
+- Embeddings: $0.01 (3%)
 ```
 
 ### Programmatic Access
@@ -996,32 +1498,51 @@ print(f"Session cost: ${session.total_ai_cost_usd:.4f}")
 
 ## Implementation Checklist
 
+### Phase 0: Instrumented Client Wrappers (Foundation)
+- [ ] Create `metrics/__init__.py` with package exports
+- [ ] Create `metrics/clients.py` with InstrumentedAnthropic, InstrumentedAsyncAnthropic
+- [ ] Add InstrumentedOpenAI for embeddings
+- [ ] Implement `track_source()` context manager
+- [ ] Add `set_event_emitter()` global configuration
+
 ### Phase 1: Core Infrastructure
-- [ ] Create `metrics/models.py` with data models
-- [ ] Create `metrics/costs.py` with pricing logic
+- [ ] Create `metrics/models.py` with data models (LLMCallMetric, EmbeddingCallMetric, etc.)
+- [ ] Create `metrics/costs.py` with pricing logic for all models
 - [ ] Create `metrics/collector.py` with MetricsCollector
-- [ ] Modify `agent.py` to emit `ai_call_start/end` events
+- [ ] Subscribe collector to `llm_call_end`, `embedding_call_end`, `tool_start/end`
 
-### Phase 2: Database
-- [ ] Add metrics tables to `memory/store.py`
-- [ ] Implement `record_ai_call()` method
-- [ ] Implement `record_tool_metric()` method
-- [ ] Implement aggregation query methods
+### Phase 2: Integration Points (Minimal Changes)
+- [ ] Update `agent.py` to use InstrumentedAsyncAnthropic
+- [ ] Update `memory/extraction.py` to use InstrumentedAnthropic + track_source("extraction")
+- [ ] Update `memory/summaries.py` to use InstrumentedAnthropic + track_source("summary")
+- [ ] Update `memory/retrieval.py` to use InstrumentedAnthropic + track_source("retrieval")
+- [ ] Update `memory/embeddings.py` to use InstrumentedOpenAI
 
-### Phase 3: Agent Tools
+### Phase 3: Database
+- [ ] Add `llm_calls` table to `memory/store.py`
+- [ ] Add `embedding_calls` table
+- [ ] Add `session_metrics` table
+- [ ] Implement `record_llm_call()` method
+- [ ] Implement `record_embedding_call()` method
+- [ ] Implement aggregation query methods (by_source, by_period, etc.)
+
+### Phase 4: Agent Tools
 - [ ] Create `tools/metrics.py` with `get_metrics` tool
+- [ ] Implement all actions: summary, costs, memory, embeddings, by_source, tools, slow, errors
 - [ ] Register tool in agent
 
-### Phase 4: Integration
+### Phase 5: Final Integration
 - [ ] Wire MetricsCollector in `memory/integration.py`
 - [ ] Add global accessor for tools
-- [ ] Update CLI to show session cost summary
+- [ ] Update CLI to show session cost summary on exit
+- [ ] Add verbose mode integration (show costs in real-time)
 
 ### Testing
-- [ ] Unit tests for cost calculation
+- [ ] Unit tests for cost calculation (all models)
+- [ ] Unit tests for instrumented clients
 - [ ] Unit tests for collector
-- [ ] Integration tests for full flow
-- [ ] Performance tests for large datasets
+- [ ] Integration tests for full flow (agent + memory system)
+- [ ] Performance tests (ensure overhead < 1ms per call)
 
 ---
 
@@ -1029,9 +1550,31 @@ print(f"Session cost: ${session.total_ai_cost_usd:.4f}")
 
 This design provides a powerful yet elegant metrics system that:
 
-1. **Minimizes code changes** - ~500 lines of new code, ~50 lines modified
-2. **Leverages existing infrastructure** - Events, SQLite, memory system
-3. **Enables agent self-awareness** - First-class introspection tools
-4. **Supports future growth** - Easy to add dashboards, alerts, exports
+1. **Tracks EVERYTHING** - Main agent, extraction, summaries, retrieval, embeddings
+2. **Minimizes code changes** - ~700 lines new, ~30 lines modified (just client swaps)
+3. **Leverages existing infrastructure** - Events, SQLite, memory system
+4. **Enables agent self-awareness** - First-class introspection tools
+5. **Uses transparent instrumentation** - Wrapper clients capture all API calls automatically
+6. **Supports future growth** - Easy to add dashboards, alerts, exports
 
-The implementation follows the existing codebase patterns and can be completed incrementally, with each phase providing immediate value.
+### Key Innovation: Instrumented Client Wrappers
+
+The most elegant aspect of this design is the **instrumented client wrapper** approach:
+
+```python
+# Instead of modifying every file that calls Claude:
+self._client = anthropic.Anthropic()
+
+# Just swap the client at initialization:
+self._client = InstrumentedAnthropic()
+
+# Everything else stays the same - metrics are captured automatically!
+```
+
+This means:
+- No need to hunt down every API call
+- Impossible to miss calls (all traffic goes through the wrapper)
+- Easy to add new metrics later
+- Existing code doesn't know it's being tracked
+
+The implementation follows existing codebase patterns and can be completed incrementally, with each phase providing immediate value. Start with Phase 0 (instrumented clients) to get visibility into all API costs immediately.
