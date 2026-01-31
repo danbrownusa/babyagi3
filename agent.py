@@ -1108,6 +1108,11 @@ CAPABILITIES:
 
 2. **Background Objectives**: For immediate complex tasks, use the 'objective' tool.
    Chat continues while objectives work in the background.
+   - **Priority**: Set priority 1-10 (lower = higher priority, default 5)
+   - **Budget Control**: Set budget_usd or token_limit to cap costs
+   - **Retry**: Failed objectives retry automatically (default 3 attempts) with exponential backoff
+   - **Concurrency**: Max 5 objectives run simultaneously; others queue by priority
+   - **Cancellation**: Cancel running objectives with immediate effect
 
 3. **Scheduling**: Use the 'schedule' tool for time-based automation:
    - **One-time**: "in 5m", "in 2h", "at 2024-01-15T09:00"
@@ -1158,6 +1163,17 @@ Use the 'schedule' tool when the user wants something to happen:
 - On a pattern: "send me a summary every weekday at 9am" → schedule(cron)
 
 Use 'objective' for immediate background work without a time component.
+
+OBJECTIVE BEST PRACTICES:
+
+- **High priority** (1-3): Urgent tasks, time-sensitive work
+- **Normal priority** (4-6): Standard background research, reports
+- **Low priority** (7-10): Nice-to-have, exploratory tasks
+- **Budget limits**: Set budget_usd for expensive operations to prevent runaway costs
+- **Token limits**: Set token_limit for tasks that might generate excessive output
+
+Example objective with controls:
+- objective(action="spawn", goal="Research competitors", priority=2, budget_usd=0.50, max_retries=5)
 
 SCHEDULE EXAMPLES:
 - "Remind me in 30 minutes" → schedule add, spec="in 30m"
