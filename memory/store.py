@@ -701,6 +701,29 @@ class MemoryStore:
             created_at=parse_datetime(row["created_at"]),
         )
 
+    def _increment_node_staleness(self, key: str, timestamp: str = None):
+        """Increment staleness counter for a summary node by key.
+
+        This is the core helper for updating summary node staleness.
+        Used by _increment_staleness_for_event to avoid SQL duplication.
+
+        Args:
+            key: The summary node key (e.g., "root", "channel:email", "entity:uuid")
+            timestamp: ISO timestamp to use, defaults to now
+        """
+        ts = timestamp or now_iso()
+        self.conn.execute(
+            """
+            UPDATE summary_nodes
+            SET events_since_update = events_since_update + 1,
+                event_count = event_count + 1,
+                last_event_at = ?,
+                updated_at = ?
+            WHERE key = ?
+        """,
+            (ts, ts, key),
+        )
+
     def _increment_staleness_for_event(
         self,
         channel: str | None,
@@ -709,77 +732,20 @@ class MemoryStore:
         task_id: str | None,
     ):
         """Increment staleness counters for relevant summary nodes."""
-        cur = self.conn.cursor()
-        now = now_iso()
+        ts = now_iso()
 
         # Root always gets incremented
-        cur.execute(
-            """
-            UPDATE summary_nodes
-            SET events_since_update = events_since_update + 1,
-                event_count = event_count + 1,
-                last_event_at = ?,
-                updated_at = ?
-            WHERE key = 'root'
-        """,
-            (now, now),
-        )
+        self._increment_node_staleness("root", ts)
 
-        # Channel
+        # Optional nodes
         if channel:
-            cur.execute(
-                """
-                UPDATE summary_nodes
-                SET events_since_update = events_since_update + 1,
-                    event_count = event_count + 1,
-                    last_event_at = ?,
-                    updated_at = ?
-                WHERE key = ?
-            """,
-                (now, now, f"channel:{channel}"),
-            )
-
-        # Tool
+            self._increment_node_staleness(f"channel:{channel}", ts)
         if tool_id:
-            cur.execute(
-                """
-                UPDATE summary_nodes
-                SET events_since_update = events_since_update + 1,
-                    event_count = event_count + 1,
-                    last_event_at = ?,
-                    updated_at = ?
-                WHERE key = ?
-            """,
-                (now, now, f"tool:{tool_id}"),
-            )
-
-        # Entity (person)
+            self._increment_node_staleness(f"tool:{tool_id}", ts)
         if person_id:
-            cur.execute(
-                """
-                UPDATE summary_nodes
-                SET events_since_update = events_since_update + 1,
-                    event_count = event_count + 1,
-                    last_event_at = ?,
-                    updated_at = ?
-                WHERE key = ?
-            """,
-                (now, now, f"entity:{person_id}"),
-            )
-
-        # Task
+            self._increment_node_staleness(f"entity:{person_id}", ts)
         if task_id:
-            cur.execute(
-                """
-                UPDATE summary_nodes
-                SET events_since_update = events_since_update + 1,
-                    event_count = event_count + 1,
-                    last_event_at = ?,
-                    updated_at = ?
-                WHERE key = ?
-            """,
-                (now, now, f"task:{task_id}"),
-            )
+            self._increment_node_staleness(f"task:{task_id}", ts)
 
         self.conn.commit()
 

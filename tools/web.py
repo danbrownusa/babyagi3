@@ -10,7 +10,7 @@ Provides web search and browser automation capabilities.
 
 import os
 import time
-from tools import tool
+from tools import tool, tool_error
 
 # Browser Use Cloud API configuration
 BROWSER_USE_API_URL = "https://api.browser-use.com/api/v2"
@@ -30,10 +30,7 @@ def web_search(query: str, max_results: int = 5) -> dict:
     try:
         from ddgs import DDGS
     except ImportError:
-        return {
-            "error": "ddgs not installed",
-            "fix": "pip install ddgs"
-        }
+        return tool_error("ddgs not installed", fix="pip install ddgs")
 
     try:
         with DDGS() as ddgs:
@@ -78,10 +75,10 @@ def browse(task: str, url: str = None, max_steps: int = 25, agent=None) -> dict:
 
     api_key = os.environ.get("BROWSER_USE_API_KEY")
     if not api_key:
-        return {
-            "error": "BROWSER_USE_API_KEY not set",
-            "fix": "Get your API key at https://cloud.browser-use.com and set BROWSER_USE_API_KEY"
-        }
+        return tool_error(
+            "BROWSER_USE_API_KEY not set",
+            fix="Get your API key at https://cloud.browser-use.com and set BROWSER_USE_API_KEY"
+        )
 
     headers = {
         "X-Browser-Use-API-Key": api_key,
@@ -193,10 +190,7 @@ def fetch_url(url: str, extract: str = None) -> dict:
         import httpx
         from bs4 import BeautifulSoup
     except ImportError:
-        return {
-            "error": "httpx and beautifulsoup4 not installed",
-            "fix": "pip install httpx beautifulsoup4"
-        }
+        return tool_error("httpx and beautifulsoup4 not installed", fix="pip install httpx beautifulsoup4")
 
     try:
         response = httpx.get(url, follow_redirects=True, timeout=30)
@@ -224,62 +218,3 @@ def fetch_url(url: str, extract: str = None) -> dict:
 
     except Exception as e:
         return {"error": str(e), "url": url}
-
-
-@tool(packages=["httpx", "agentmail"], env=["BROWSER_USE_API_KEY", "AGENTMAIL_API_KEY"])
-def auto_signup(
-    service_url: str,
-    service_name: str,
-    agent=None
-) -> dict:
-    """Automatically sign up for a service and retrieve API keys.
-
-    This is a high-level tool that combines browser automation with email
-    verification to fully automate service signup and API key retrieval.
-
-    Uses Browser Use Cloud for browser automation.
-    Requires: BROWSER_USE_API_KEY, AGENTMAIL_API_KEY
-
-    The process:
-    1. Navigate to signup page
-    2. Create account using agent's email
-    3. Check email for verification
-    4. Complete verification
-    5. Navigate to API/dashboard
-    6. Extract and store API key
-
-    Args:
-        service_url: The signup or main page URL of the service
-        service_name: Name of the service (used for storing the API key)
-    """
-    # Check required API keys
-    missing = []
-    if not os.environ.get("BROWSER_USE_API_KEY"):
-        missing.append("BROWSER_USE_API_KEY")
-    if not os.environ.get("AGENTMAIL_API_KEY"):
-        missing.append("AGENTMAIL_API_KEY")
-
-    if missing:
-        return {
-            "error": f"Missing required API keys: {', '.join(missing)}",
-            "fix": {
-                "BROWSER_USE_API_KEY": "https://cloud.browser-use.com",
-                "AGENTMAIL_API_KEY": "https://agentmail.to"
-            }
-        }
-
-    # This is a meta-tool that orchestrates browse + email + secrets
-    # The agent can call this, or do the steps manually for more control
-    return {
-        "status": "ready",
-        "message": f"To sign up for {service_name}, I'll need to:",
-        "steps": [
-            f"1. Browse to {service_url} and find signup",
-            "2. Create account with agent email address (use get_agent_email)",
-            "3. Check inbox for verification email (use check_inbox/wait_for_email)",
-            "4. Complete email verification via browse()",
-            "5. Navigate to API keys/dashboard section",
-            f"6. Extract and store API key as {service_name.upper()}_API_KEY (use store_secret)"
-        ],
-        "hint": "Use browse(), check_inbox(), wait_for_email(), and store_secret() to complete these steps"
-    }

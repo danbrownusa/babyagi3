@@ -18,93 +18,8 @@ Setup:
 
 import os
 import time
-from tools import tool
-
-# Cache the client and inbox
-_client = None
-_default_inbox = None
-_default_inbox_id = None
-
-
-def _get_client():
-    """Get or create AgentMail client."""
-    global _client
-
-    if _client is not None:
-        return _client
-
-    try:
-        from agentmail import AgentMail
-    except ImportError:
-        return None
-
-    api_key = os.environ.get("AGENTMAIL_API_KEY")
-    if not api_key:
-        return None
-
-    _client = AgentMail(api_key=api_key)
-    return _client
-
-
-def _get_inbox_id():
-    """Get the inbox ID (email address) to use.
-
-    Priority:
-    1. AGENTMAIL_INBOX_ID environment variable (if set)
-    2. First inbox from account
-    3. Create a new inbox
-
-    Returns the inbox_id (email address format like 'name@agentmail.to')
-    """
-    global _default_inbox_id, _default_inbox
-
-    # Check if we already have a cached inbox ID
-    if _default_inbox_id is not None:
-        return _default_inbox_id
-
-    # Check for configured inbox ID first
-    configured_inbox = os.environ.get("AGENTMAIL_INBOX_ID")
-    if configured_inbox:
-        _default_inbox_id = configured_inbox
-        return _default_inbox_id
-
-    client = _get_client()
-    if not client:
-        return None
-
-    try:
-        # Try to get existing inboxes first
-        inboxes_response = client.inboxes.list()
-        # Handle both list response object and direct list
-        inboxes = getattr(inboxes_response, 'inboxes', None) or inboxes_response
-
-        if inboxes and len(inboxes) > 0:
-            inbox = inboxes[0]
-            _default_inbox = inbox
-            # inbox_id is the email address (e.g., 'name@agentmail.to')
-            _default_inbox_id = getattr(inbox, 'inbox_id', None) or getattr(inbox, 'id', None)
-            return _default_inbox_id
-
-        # Create a new inbox if none exist
-        inbox = client.inboxes.create()
-        _default_inbox = inbox
-        _default_inbox_id = getattr(inbox, 'inbox_id', None) or getattr(inbox, 'id', None)
-        return _default_inbox_id
-
-    except Exception:
-        return None
-
-
-def _get_default_inbox():
-    """Get or create the agent's default inbox object (for backwards compatibility)."""
-    global _default_inbox
-
-    if _default_inbox is not None:
-        return _default_inbox
-
-    # This will populate _default_inbox as a side effect
-    _get_inbox_id()
-    return _default_inbox
+from tools import tool, tool_error
+from utils.email_client import get_client, get_inbox_id
 
 
 @tool(packages=["agentmail"], env=["AGENTMAIL_API_KEY"])
@@ -122,20 +37,17 @@ def get_agent_email() -> dict:
     try:
         from agentmail import AgentMail
     except ImportError:
-        return {
-            "error": "agentmail not installed",
-            "fix": "pip install agentmail"
-        }
+        return tool_error("agentmail not installed", fix="pip install agentmail")
 
     if not os.environ.get("AGENTMAIL_API_KEY"):
-        return {
-            "error": "AGENTMAIL_API_KEY not set",
-            "fix": "Get API key from https://agentmail.to and set AGENTMAIL_API_KEY environment variable"
-        }
+        return tool_error(
+            "AGENTMAIL_API_KEY not set",
+            fix="Get API key from https://agentmail.to and set AGENTMAIL_API_KEY environment variable"
+        )
 
-    inbox_id = _get_inbox_id()
+    inbox_id = get_inbox_id()
     if not inbox_id:
-        return {"error": "Failed to get or create inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address."}
+        return tool_error("Failed to get or create inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address.")
 
     # inbox_id is the email address (e.g., 'name@agentmail.to')
     return {
@@ -156,21 +68,15 @@ def send_email(to: str, subject: str, body: str) -> dict:
     try:
         from agentmail import AgentMail
     except ImportError:
-        return {
-            "error": "agentmail not installed",
-            "fix": "pip install agentmail"
-        }
+        return tool_error("agentmail not installed", fix="pip install agentmail")
 
-    client = _get_client()
+    client = get_client()
     if not client:
-        return {
-            "error": "AGENTMAIL_API_KEY not set",
-            "fix": "Get API key from https://agentmail.to"
-        }
+        return tool_error("AGENTMAIL_API_KEY not set", fix="Get API key from https://agentmail.to")
 
-    inbox_id = _get_inbox_id()
+    inbox_id = get_inbox_id()
     if not inbox_id:
-        return {"error": "Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address."}
+        return tool_error("Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address.")
 
     try:
         # Use client.inboxes.messages.send() with text parameter (not body)
@@ -206,21 +112,15 @@ def check_inbox(limit: int = 10, unread_only: bool = True) -> dict:
     try:
         from agentmail import AgentMail
     except ImportError:
-        return {
-            "error": "agentmail not installed",
-            "fix": "pip install agentmail"
-        }
+        return tool_error("agentmail not installed", fix="pip install agentmail")
 
-    client = _get_client()
+    client = get_client()
     if not client:
-        return {
-            "error": "AGENTMAIL_API_KEY not set",
-            "fix": "Get API key from https://agentmail.to"
-        }
+        return tool_error("AGENTMAIL_API_KEY not set", fix="Get API key from https://agentmail.to")
 
-    inbox_id = _get_inbox_id()
+    inbox_id = get_inbox_id()
     if not inbox_id:
-        return {"error": "Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address."}
+        return tool_error("Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address.")
 
     try:
         # Use client.inboxes.messages.list()
@@ -266,20 +166,15 @@ def read_email(message_id: str) -> dict:
     try:
         from agentmail import AgentMail
     except ImportError:
-        return {
-            "error": "agentmail not installed",
-            "fix": "pip install agentmail"
-        }
+        return tool_error("agentmail not installed", fix="pip install agentmail")
 
-    client = _get_client()
+    client = get_client()
     if not client:
-        return {
-            "error": "AGENTMAIL_API_KEY not set"
-        }
+        return tool_error("AGENTMAIL_API_KEY not set")
 
-    inbox_id = _get_inbox_id()
+    inbox_id = get_inbox_id()
     if not inbox_id:
-        return {"error": "Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address."}
+        return tool_error("Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address.")
 
     try:
         # Use client.inboxes.messages.get()
@@ -317,18 +212,15 @@ def wait_for_email(
     try:
         from agentmail import AgentMail
     except ImportError:
-        return {
-            "error": "agentmail not installed",
-            "fix": "pip install agentmail"
-        }
+        return tool_error("agentmail not installed", fix="pip install agentmail")
 
-    client = _get_client()
+    client = get_client()
     if not client:
-        return {"error": "AGENTMAIL_API_KEY not set"}
+        return tool_error("AGENTMAIL_API_KEY not set")
 
-    inbox_id = _get_inbox_id()
+    inbox_id = get_inbox_id()
     if not inbox_id:
-        return {"error": "Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address."}
+        return tool_error("Failed to get inbox. Set AGENTMAIL_INBOX_ID environment variable with your inbox email address.")
 
     start_time = time.time()
     poll_interval = 3  # seconds
