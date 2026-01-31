@@ -17,7 +17,15 @@ Channel input     → message
 
 This means the entire system reduces to: **a loop that processes messages and decides what to do next.**
 
-## What's New in v0.3.0
+## What's New in v0.3.1
+
+- **Skills System** — Learn new behaviors from SKILL.md files with safety scanning
+- **Composio Integration** — Connect to 250+ apps (Slack, GitHub, Notion) via OAuth
+- **Workflow Tools** — Combine skills and tools into reusable multi-step workflows
+- **Three Tool Types** — Executable (Python), Skills (behavioral), and Composio (external apps)
+- **Dependency Tracking** — Tools can declare dependencies on other tools and skills
+
+### Previous (v0.3.0)
 
 - **Multi-Channel Architecture** — Receive messages from CLI, email, voice, and more
 - **Full-Featured Scheduler** — Cron expressions, intervals, one-time tasks with persistence
@@ -125,6 +133,32 @@ Tool {
   env: list[str]       # Required env vars
 }
 
+ToolDefinition {
+  id: string
+  name: string
+  description: string
+  tool_type: "executable" | "skill" | "composio"
+
+  # For executable tools
+  source_code: string | None
+  parameters: json_schema
+  packages: list[str]
+
+  # For skills
+  skill_content: string | None  # SKILL.md markdown
+
+  # For composio tools
+  composio_app: string | None   # "SLACK", "GITHUB"
+  composio_action: string | None
+
+  # Dependencies
+  depends_on: list[str]  # Other tools/skills
+
+  # Stats
+  usage_count: int
+  success_rate: float
+}
+
 Thread {
   id: string
   messages: Message[]
@@ -190,6 +224,10 @@ export BROWSER_USE_API_KEY="your-browser-use-key"
 
 # For dynamic tool sandboxing
 export E2B_API_KEY="your-e2b-key"
+
+# For Composio integrations (250+ apps)
+pip install composio-core
+composio login  # or set COMPOSIO_API_KEY
 
 # For voice channel (install separately)
 pip install sounddevice numpy openai-whisper pyttsx3
@@ -467,6 +505,119 @@ agent.run("Convert 100 Celsius to Fahrenheit")
 ```
 
 Tools that require external packages are automatically detected and sandboxed for safety.
+
+### Skills Tool
+
+Skills are behavioral instructions stored as SKILL.md files. Unlike executable tools that run code, skills provide guidance that the AI follows.
+
+```python
+# Acquire a skill from a URL or file
+agent.run("Learn the code review skill from https://example.com/skills/code-review/SKILL.md")
+
+# Acquire with auto-enable if safe
+agent.run("Acquire skill from ~/my-skills/email-triage.md and enable it if safe")
+
+# Check skill readiness
+agent.run("Check if the email-triage skill has all required tools")
+
+# Activate a skill to get instructions
+agent.run("Activate the code review skill")
+```
+
+**SKILL.md Format:**
+
+```markdown
+---
+name: code-review
+description: Guidelines for thorough code reviews
+---
+
+# Code Review Skill
+
+When reviewing code, follow these steps:
+1. Check for security vulnerabilities
+2. Verify error handling
+3. Look for performance issues
+4. Ensure tests are adequate
+```
+
+**Safety Scanning:**
+- Skills are scanned for dangerous patterns before activation
+- Score >= 80: Safe, can auto-enable
+- Score < 80: Requires manual review
+- Critical patterns (eval, exec, prompt injection): Auto-rejected
+
+### Composio Integration
+
+Composio provides 250+ OAuth app integrations (Slack, GitHub, Notion, Gmail, etc.). Once connected, Composio actions become tools in your toolkit.
+
+```python
+# List available apps
+agent.run("Show me what Composio apps are available")
+
+# Connect to an app (starts OAuth flow)
+agent.run("Connect to Slack via Composio")
+
+# Enable app tools
+agent.run("Enable all GitHub actions from Composio")
+
+# Enable specific actions only
+agent.run("Enable only SLACK_SEND_MESSAGE from Composio")
+
+# Check connection status
+agent.run("What Composio integrations do I have enabled?")
+
+# Use Composio tools (after enabling)
+agent.run("Send a message to #general on Slack saying 'Hello from BabyAGI!'")
+```
+
+**Setup:**
+
+```bash
+# Install Composio
+pip install composio-core
+
+# Login to Composio
+composio login
+
+# Set API key (alternative)
+export COMPOSIO_API_KEY="your-key"
+```
+
+**Composio Actions:**
+- `list_apps` — Show all available apps
+- `list_actions` — Show actions for a specific app
+- `connect` — Start OAuth flow to authorize an app
+- `enable` — Register Composio actions as tools
+- `disable` — Remove tools (keeps Composio auth)
+- `status` — Show what's connected and enabled
+
+### Workflow Tools
+
+Workflows combine multiple tools and skills into reusable automation.
+
+```python
+# Create a workflow
+agent.run("""
+Create a workflow called 'daily_standup' that:
+1. Activates the standup format skill
+2. Gathers yesterday's completed tasks
+3. Posts the summary to Slack #standup
+""")
+
+# Workflows can declare dependencies
+agent.run("""
+Create workflow 'pr_review' depending on:
+- skill_code_review
+- github_create_review
+""")
+```
+
+**Workflow Features:**
+- Dependencies are verified before creation
+- Generated as executable Python tools
+- Can combine skills with executable tools
+- Persisted for reuse across sessions
 
 ### Send Message Tool
 
@@ -919,12 +1070,13 @@ summary = get_health_summary()
 |-----------|----------------|
 | **Single loop** | One control flow for everything |
 | **Tools are data** | Same structure handles memory, tasks, objectives, scheduling |
+| **Three tool types** | Executable (code), Skills (behavior), Composio (integrations) |
 | **LLM does the hard work** | Routing, synthesis, organization |
 | **No frameworks** | Just Python and the API |
-| **Extensible by design** | New capabilities = new tools |
-| **Safe extensibility** | Dynamic tools run in sandboxed environment |
+| **Extensible by design** | New capabilities = new tools, skills, or Composio apps |
+| **Safe extensibility** | Dynamic tools sandboxed, skills safety-scanned |
 | **Graceful degradation** | Missing packages/APIs degrade functionality but don't crash |
-| **Persistence** | Scheduled tasks survive restarts |
+| **Persistence** | Tools, skills, and scheduled tasks survive restarts |
 
 ### The Entire System
 
@@ -936,6 +1088,7 @@ agent.py
 ├── Agent class (main loop + channel support + EventEmitter)
 ├── Objective class (background work)
 ├── Core tools (memory, objectives, notes, schedule, register, send_message)
+├── Skill/Composio loading (three tool types on startup)
 └── Sender registration
 
 scheduler.py
@@ -963,6 +1116,7 @@ senders/
 tools/
 ├── __init__.py (decorator framework + health checks)
 ├── sandbox.py (e2b code execution)
+├── skills.py (skills, Composio, workflows)
 ├── web.py (search, browse, fetch)
 ├── email.py (AgentMail tools)
 └── secrets.py (secure key storage)
