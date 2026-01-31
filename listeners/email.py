@@ -9,6 +9,8 @@ import asyncio
 import logging
 import os
 
+from utils.email_client import get_client, get_inbox_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,35 +29,17 @@ async def run_email_listener(agent, config: dict = None):
     owner_email = config.get("owner_email") or os.environ.get("OWNER_EMAIL")
     poll_interval = config.get("poll_interval", 60)
 
-    # Get email client
-    try:
-        from agentmail import AgentMail
-    except ImportError:
-        logger.warning("Email listener disabled: agentmail package not installed")
+    # Get email client using shared singleton
+    client = get_client()
+    if not client:
+        logger.warning("Email listener disabled: agentmail not available or AGENTMAIL_API_KEY not set")
         return
 
-    api_key = config.get("api_key") or os.environ.get("AGENTMAIL_API_KEY")
-    if not api_key:
-        logger.warning("Email listener disabled: AGENTMAIL_API_KEY not set")
-        return
-
-    client = AgentMail(api_key=api_key)
-
-    # Get inbox ID
-    inbox_id = config.get("inbox_id") or os.environ.get("AGENTMAIL_INBOX_ID")
+    # Get inbox ID using shared logic
+    inbox_id = config.get("inbox_id") or get_inbox_id()
     if not inbox_id:
-        try:
-            inboxes_response = client.inboxes.list()
-            inboxes = getattr(inboxes_response, 'inboxes', None) or inboxes_response
-            if inboxes and len(inboxes) > 0:
-                inbox = inboxes[0]
-                inbox_id = getattr(inbox, 'inbox_id', None) or getattr(inbox, 'id', None)
-            else:
-                inbox = client.inboxes.create()
-                inbox_id = getattr(inbox, 'inbox_id', None) or getattr(inbox, 'id', None)
-        except Exception as e:
-            logger.error(f"Email listener disabled: Could not get inbox: {e}")
-            return
+        logger.error("Email listener disabled: Could not get inbox")
+        return
 
     logger.info(f"Email listener started for {inbox_id}")
     processed_ids = set()

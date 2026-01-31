@@ -34,6 +34,62 @@ class VerboseLevel(IntEnum):
     DEEP = 2
 
 
+def parse_verbose_level(value: str | int | VerboseLevel) -> VerboseLevel:
+    """Parse a verbose level from string, int, or VerboseLevel.
+
+    This is the single source of truth for verbose level parsing.
+    Used by Console and tools/verbose.py.
+
+    Args:
+        value: String ("off", "light", "deep", "0", "1", "2"),
+               int (0-2), or VerboseLevel enum.
+
+    Returns:
+        VerboseLevel enum value.
+
+    Examples:
+        parse_verbose_level("off") -> VerboseLevel.OFF
+        parse_verbose_level("1") -> VerboseLevel.LIGHT
+        parse_verbose_level(2) -> VerboseLevel.DEEP
+    """
+    if isinstance(value, VerboseLevel):
+        return value
+
+    if isinstance(value, int):
+        return VerboseLevel(min(max(value, 0), 2))
+
+    # String parsing
+    level_str = str(value).lower().strip()
+
+    # Map of string values to levels
+    level_map = {
+        # OFF
+        "0": VerboseLevel.OFF,
+        "off": VerboseLevel.OFF,
+        "none": VerboseLevel.OFF,
+        "false": VerboseLevel.OFF,
+        # LIGHT
+        "1": VerboseLevel.LIGHT,
+        "light": VerboseLevel.LIGHT,
+        "on": VerboseLevel.LIGHT,
+        "true": VerboseLevel.LIGHT,
+        # DEEP
+        "2": VerboseLevel.DEEP,
+        "deep": VerboseLevel.DEEP,
+        "full": VerboseLevel.DEEP,
+        "all": VerboseLevel.DEEP,
+    }
+
+    if level_str in level_map:
+        return level_map[level_str]
+
+    # Try numeric conversion
+    try:
+        return VerboseLevel(int(level_str))
+    except (ValueError, TypeError):
+        return VerboseLevel.OFF
+
+
 # ANSI color codes
 class Colors:
     """ANSI escape codes for terminal colors."""
@@ -108,20 +164,8 @@ class Console:
 
     def _load_verbose_level(self) -> VerboseLevel:
         """Load verbose level from environment."""
-        env_val = os.environ.get("BABYAGI_VERBOSE", "0").lower()
-
-        if env_val in ("0", "off", "none", "false"):
-            return VerboseLevel.OFF
-        elif env_val in ("1", "light", "on", "true"):
-            return VerboseLevel.LIGHT
-        elif env_val in ("2", "deep", "full", "all"):
-            return VerboseLevel.DEEP
-
-        # Try numeric
-        try:
-            return VerboseLevel(int(env_val))
-        except (ValueError, TypeError):
-            return VerboseLevel.OFF
+        env_val = os.environ.get("BABYAGI_VERBOSE", "0")
+        return parse_verbose_level(env_val)
 
     def set_verbose(self, level: VerboseLevel | int | str):
         """
@@ -130,18 +174,7 @@ class Console:
         Args:
             level: VerboseLevel enum, int (0-2), or string ("off", "light", "deep")
         """
-        if isinstance(level, str):
-            level = level.lower()
-            if level in ("0", "off", "none", "false"):
-                self._verbose_level = VerboseLevel.OFF
-            elif level in ("1", "light", "on", "true"):
-                self._verbose_level = VerboseLevel.LIGHT
-            elif level in ("2", "deep", "full", "all"):
-                self._verbose_level = VerboseLevel.DEEP
-        elif isinstance(level, int):
-            self._verbose_level = VerboseLevel(min(max(level, 0), 2))
-        else:
-            self._verbose_level = level
+        self._verbose_level = parse_verbose_level(level)
 
     def get_verbose(self) -> VerboseLevel:
         """Get current verbose level."""

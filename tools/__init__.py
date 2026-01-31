@@ -35,6 +35,34 @@ _registered_tools = []
 
 
 # =============================================================================
+# Tool Response Helpers
+# =============================================================================
+
+def tool_error(error: str, fix: str = None, **extras) -> dict:
+    """Create a standardized tool error response.
+
+    Use this helper to ensure consistent error format across all tools.
+
+    Args:
+        error: The error message
+        fix: Optional hint on how to fix the error
+        **extras: Additional fields to include in the response
+
+    Returns:
+        Dict with error key and optional fix/extra fields.
+
+    Example:
+        return tool_error("API key not set", fix="Set MYAPI_KEY env var")
+        return tool_error("Not found", status_code=404)
+    """
+    result = {"error": error}
+    if fix:
+        result["fix"] = fix
+    result.update(extras)
+    return result
+
+
+# =============================================================================
 # Health Check Utilities (Reusable)
 # =============================================================================
 
