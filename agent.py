@@ -13,6 +13,7 @@ Chat continues while objectives work. Objectives can spawn sub-objectives.
 """
 
 import asyncio
+import heapq
 import json
 import threading
 import time
@@ -23,6 +24,12 @@ from typing import Callable, Protocol, runtime_checkable
 
 import anthropic
 
+from metrics import (
+    InstrumentedAsyncAnthropic,
+    MetricsCollector,
+    set_event_emitter,
+    track_source,
+)
 from scheduler import (
     Scheduler, ScheduledTask, Schedule, SchedulerStore,
     create_task, parse_schedule, RunRecord
@@ -45,6 +52,16 @@ def json_serialize(obj):
 
 class ToolValidationError(Exception):
     """Raised when a tool fails validation during registration."""
+    pass
+
+
+class BudgetExceededException(Exception):
+    """Raised when an objective exceeds its allocated budget."""
+    pass
+
+
+class ObjectiveCancelledException(Exception):
+    """Raised when an objective is cancelled during execution."""
     pass
 
 
@@ -75,13 +92,24 @@ class Objective:
     """
     id: str
     goal: str
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"  # pending, running, completed, failed, cancelled
     thread_id: str = ""
     schedule: str | None = None  # cron expression for recurring
     result: str | None = None
     error: str | None = None
     created: str = ""
     completed: str | None = None
+    # Priority: 1=highest, 10=lowest (default 5)
+    priority: int = 5
+    # Retry configuration
+    retry_count: int = 0
+    max_retries: int = 3
+    last_error: str | None = None
+    # Budget tracking
+    budget_usd: float | None = None  # Max cost allowed (None = unlimited)
+    spent_usd: float = 0.0
+    token_limit: int | None = None  # Max tokens allowed (None = unlimited)
+    tokens_used: int = 0
 
     def __post_init__(self):
         if not self.thread_id:
@@ -164,13 +192,26 @@ class Agent(EventEmitter):
     def __init__(self, model: str = "claude-sonnet-4-20250514", load_tools: bool = True, config: dict = None):
         self.__init_events__()  # Initialize event system
 
-        self.client = anthropic.AsyncAnthropic()
+        # Use instrumented client for automatic metrics tracking
+        self.client = InstrumentedAsyncAnthropic()
+        set_event_emitter(self)  # Agent is an EventEmitter, metrics emit through it
+
         self.model = model
         self.tools: dict[str, Tool] = {}
         self.threads: dict[str, list] = {"main": []}
         self.objectives: dict[str, Objective] = {}
         self._running_objectives: set[str] = set()
         self._lock = asyncio.Lock()
+
+        # Concurrency control for objectives
+        self.MAX_CONCURRENT_OBJECTIVES = 5
+        self._concurrency_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_OBJECTIVES)
+
+        # Cancellation tokens for stopping running objectives
+        self._cancellation_tokens: dict[str, asyncio.Event] = {}
+
+        # Priority queue for objectives: (priority, timestamp, obj_id)
+        self._objective_queue: list[tuple[int, float, str]] = []
 
         # Reference to main event loop for tools running in thread pool
         # Set when first async operation runs
@@ -191,6 +232,13 @@ class Agent(EventEmitter):
 
         # Memory system - try SQLite, gracefully fall back to in-memory
         self.memory = self._initialize_memory()
+
+        # Metrics collector for tracking costs and performance
+        self.metrics_collector = MetricsCollector(
+            store=self.memory.store if self.memory else None
+        )
+        self.metrics_collector.attach(self)
+        _set_metrics_collector(self.metrics_collector)  # Set global for tool access
 
         # Register core tools
         self._register_core_tools()
@@ -377,11 +425,24 @@ class Agent(EventEmitter):
         self.register(_register_tool_tool(self))
         self.register(_send_message_tool(self))
 
+        # Register skill and composio management tools
+        try:
+            from tools.skills import get_skill_tools
+            for tool in get_skill_tools(self, Tool):
+                self.register(tool)
+        except ImportError:
+            pass  # Skills module not available
+
     def _load_persisted_tools(self):
         """Load dynamically-created tools from the database on startup.
 
         This enables self-improvement: tools the agent creates persist
         across restarts and are automatically reloaded.
+
+        Handles three tool types:
+        - "executable": Python code that runs directly
+        - "skill": Returns behavioral instructions when called
+        - "composio": Thin wrapper that calls Composio library
 
         Tools that fail to load are disabled rather than crashing.
         """
@@ -395,10 +456,41 @@ class Agent(EventEmitter):
 
             loaded = 0
             failed = 0
+            skills_loaded = 0
+            composio_loaded = 0
+
+            # Try to import skill helpers
+            try:
+                from tools.skills import create_skill_tool, create_composio_tool
+                skills_available = True
+            except ImportError:
+                skills_available = False
+
+            # Try to get composio client for composio tools
+            composio_client = None
+            try:
+                from composio import Composio
+                composio_client = Composio()
+            except Exception:
+                pass  # Composio not available
 
             for tool_def in tool_defs:
                 try:
-                    tool = self._reconstruct_tool(tool_def)
+                    tool = None
+                    tool_type = getattr(tool_def, 'tool_type', 'executable') or 'executable'
+
+                    if tool_type == "skill" and skills_available:
+                        # Skill tool - returns instructions
+                        tool = create_skill_tool(tool_def, Tool)
+                        skills_loaded += 1
+                    elif tool_type == "composio" and composio_client:
+                        # Composio tool - wraps Composio API
+                        tool = create_composio_tool(tool_def, Tool, composio_client)
+                        composio_loaded += 1
+                    else:
+                        # Executable tool - reconstruct from source code
+                        tool = self._reconstruct_tool(tool_def)
+
                     if tool:
                         # Register without emitting event (already persisted)
                         self.tools[tool.name] = tool
@@ -415,11 +507,22 @@ class Agent(EventEmitter):
                         pass  # Best effort disable
 
             if loaded > 0 or failed > 0:
+                details = []
+                if skills_loaded > 0:
+                    details.append(f"{skills_loaded} skills")
+                if composio_loaded > 0:
+                    details.append(f"{composio_loaded} composio")
+                exec_count = loaded - skills_loaded - composio_loaded
+                if exec_count > 0:
+                    details.append(f"{exec_count} executable")
+
+                detail_str = f" ({', '.join(details)})" if details else ""
+
                 if failed == 0:
-                    console.success(f"Tools: loaded {loaded} persisted tool(s)")
+                    console.success(f"Tools: loaded {loaded} persisted tool(s){detail_str}")
                 else:
                     console.warning(
-                        f"Tools: loaded {loaded}, disabled {failed} broken tool(s)"
+                        f"Tools: loaded {loaded}{detail_str}, disabled {failed} broken tool(s)"
                     )
 
         except Exception as e:
@@ -702,6 +805,17 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
             self._current_context = context
 
             thread = self.threads.setdefault(thread_id, [])
+
+            # Auto-repair corrupted threads (orphaned tool_use without tool_result)
+            # This prevents "tool_use ids were found without tool_result blocks" errors
+            if thread:
+                repair_result = self.repair_thread(thread_id)
+                if repair_result.get("repaired", 0) > 0:
+                    self.emit("thread_repaired", {
+                        "thread_id": thread_id,
+                        "repaired": repair_result["repaired"]
+                    })
+
             thread.append({"role": "user", "content": user_input})
 
             # Refresh tool selection for this turn
@@ -721,12 +835,26 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
                     messages=thread
                 )
 
+                # Track budget and tokens for objectives
+                if thread_id.startswith("objective_"):
+                    obj_id = thread_id.replace("objective_", "")
+                    await self._track_objective_usage(obj_id, response)
+
+                # Check cancellation for objectives
+                if thread_id.startswith("objective_"):
+                    obj_id = thread_id.replace("objective_", "")
+                    if obj_id in self._cancellation_tokens and self._cancellation_tokens[obj_id].is_set():
+                        raise ObjectiveCancelledException(f"Objective {obj_id} was cancelled")
+
                 thread.append({"role": "assistant", "content": response.content})
 
                 if response.stop_reason == "end_turn":
                     return self._extract_text(response)
 
                 # Execute tools (in thread pool to avoid blocking event loop)
+                # CRITICAL: We must ensure a tool_result is appended for every tool_use,
+                # even if execution fails. Otherwise the thread becomes corrupted and
+                # the API will reject subsequent messages.
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
@@ -737,72 +865,225 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
                         })
 
                         start_time = time.time()
-                        # Run tool in thread pool to prevent blocking the event loop
-                        # This allows scheduler and other async tasks to run during tool execution
-                        result = await asyncio.to_thread(
-                            self.tools[block.name].execute, block.input, self
-                        )
+                        result = None
+                        error_msg = None
+
+                        try:
+                            # Check if tool exists
+                            if block.name not in self.tools:
+                                error_msg = f"Tool '{block.name}' not found"
+                                result = {"error": error_msg}
+                            else:
+                                # Run tool in thread pool to prevent blocking the event loop
+                                # This allows scheduler and other async tasks to run during tool execution
+                                result = await asyncio.to_thread(
+                                    self.tools[block.name].execute, block.input, self
+                                )
+                        except Exception as e:
+                            # Tool execution failed - capture the error
+                            error_msg = f"Tool execution failed: {str(e)}"
+                            result = {"error": error_msg}
+
                         duration_ms = int((time.time() - start_time) * 1000)
 
-                        # Emit tool_end event
+                        # Emit tool_end event (even on error, for logging)
                         self.emit("tool_end", {
                             "name": block.name,
                             "result": result,
                             "duration_ms": duration_ms
                         })
 
+                        # Serialize result safely
+                        try:
+                            result_json = json.dumps(result, default=json_serialize)
+                        except Exception as e:
+                            # JSON serialization failed - use error message instead
+                            result_json = json.dumps({
+                                "error": f"Result serialization failed: {str(e)}",
+                                "original_type": type(result).__name__
+                            })
+
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": json.dumps(result, default=json_serialize)
+                            "content": result_json
                         })
 
                 thread.append({"role": "user", "content": tool_results})
 
     async def run_objective(self, objective_id: str):
-        """Execute an objective in the background."""
+        """Execute an objective in the background with concurrency control and retry logic."""
         obj = self.objectives.get(objective_id)
-        if not obj or obj.status != "pending":
+        if not obj or obj.status not in ("pending", "running"):
             return
 
-        async with self._lock:
-            if objective_id in self._running_objectives:
+        # Check if cancelled before starting
+        if obj.status == "cancelled":
+            return
+
+        # Create cancellation token for this objective
+        cancel_event = self._cancellation_tokens.setdefault(objective_id, asyncio.Event())
+
+        # Acquire concurrency semaphore (limits concurrent objectives)
+        async with self._concurrency_semaphore:
+            # Check cancellation after acquiring semaphore
+            if cancel_event.is_set() or obj.status == "cancelled":
+                self._cleanup_objective(objective_id)
                 return
-            self._running_objectives.add(objective_id)
-            obj.status = "running"
 
-        # Emit objective_start event
-        self.emit("objective_start", {"id": objective_id, "goal": obj.goal})
+            async with self._lock:
+                if objective_id in self._running_objectives:
+                    return
+                self._running_objectives.add(objective_id)
+                obj.status = "running"
 
-        try:
-            # Run the objective with its own thread
-            prompt = f"""Complete this objective: {obj.goal}
+            # Emit objective_start event
+            self.emit("objective_start", {
+                "id": objective_id,
+                "goal": obj.goal,
+                "priority": obj.priority,
+                "attempt": obj.retry_count + 1
+            })
+
+            try:
+                # Run the objective with its own thread
+                prompt = f"""Complete this objective: {obj.goal}
 
 Work autonomously. Use tools as needed. When done, provide a final summary."""
 
-            result = await self.run_async(prompt, obj.thread_id)
-            obj.result = result
-            obj.status = "completed"
+                result = await self.run_async(prompt, obj.thread_id)
+
+                # Check if cancelled during execution
+                if cancel_event.is_set() or obj.status == "cancelled":
+                    self._cleanup_objective(objective_id)
+                    return
+
+                obj.result = result
+                obj.status = "completed"
+                obj.completed = datetime.now().isoformat()
+
+                # Emit objective_end event (success)
+                self.emit("objective_end", {
+                    "id": objective_id,
+                    "status": "completed",
+                    "result": result,
+                    "spent_usd": obj.spent_usd,
+                    "tokens_used": obj.tokens_used
+                })
+
+            except BudgetExceededException as e:
+                # Budget exceeded - do not retry
+                obj.status = "failed"
+                obj.error = str(e)
+                self.emit("objective_end", {
+                    "id": objective_id,
+                    "status": "failed",
+                    "error": str(e),
+                    "spent_usd": obj.spent_usd,
+                    "tokens_used": obj.tokens_used
+                })
+
+            except ObjectiveCancelledException:
+                # Cancelled - already handled
+                self._cleanup_objective(objective_id)
+
+            except Exception as e:
+                obj.last_error = str(e)
+                obj.retry_count += 1
+
+                if obj.retry_count < obj.max_retries:
+                    # Exponential backoff: 2^retry_count seconds (2s, 4s, 8s)
+                    delay = 2 ** obj.retry_count
+                    obj.status = "pending"  # Reset for retry
+
+                    self.emit("objective_retry", {
+                        "id": objective_id,
+                        "attempt": obj.retry_count,
+                        "max_retries": obj.max_retries,
+                        "delay_seconds": delay,
+                        "error": str(e)
+                    })
+
+                    # Schedule retry after delay
+                    await asyncio.sleep(delay)
+                    self._running_objectives.discard(objective_id)
+                    # Re-queue with same priority
+                    self._spawn_background_task(self.run_objective(objective_id))
+                    return
+                else:
+                    # Max retries exceeded
+                    obj.status = "failed"
+                    obj.error = f"Failed after {obj.max_retries} attempts. Last error: {e}"
+
+                    self.emit("objective_end", {
+                        "id": objective_id,
+                        "status": "failed",
+                        "error": obj.error,
+                        "attempts": obj.retry_count
+                    })
+
+            finally:
+                self._running_objectives.discard(objective_id)
+
+    def _cleanup_objective(self, objective_id: str):
+        """Clean up resources for a cancelled objective."""
+        obj = self.objectives.get(objective_id)
+        if obj:
+            obj.status = "cancelled"
             obj.completed = datetime.now().isoformat()
+        self._running_objectives.discard(objective_id)
+        self._cancellation_tokens.pop(objective_id, None)
+        self.emit("objective_end", {
+            "id": objective_id,
+            "status": "cancelled"
+        })
 
-            # Emit objective_end event (success)
-            self.emit("objective_end", {
-                "id": objective_id,
-                "status": "completed",
-                "result": result
-            })
-        except Exception as e:
-            obj.status = "failed"
-            obj.error = str(e)
+    async def _track_objective_usage(self, objective_id: str, response):
+        """Track token usage and cost for an objective, raising if budget exceeded."""
+        obj = self.objectives.get(objective_id)
+        if not obj:
+            return
 
-            # Emit objective_end event (failure)
-            self.emit("objective_end", {
-                "id": objective_id,
-                "status": "failed",
-                "error": str(e)
-            })
-        finally:
-            self._running_objectives.discard(objective_id)
+        # Extract usage from response
+        usage = getattr(response, 'usage', None)
+        if not usage:
+            return
+
+        input_tokens = getattr(usage, 'input_tokens', 0)
+        output_tokens = getattr(usage, 'output_tokens', 0)
+        total_tokens = input_tokens + output_tokens
+
+        # Update token count
+        obj.tokens_used += total_tokens
+
+        # Calculate cost (using Claude Sonnet pricing as default)
+        # Input: $3/1M tokens, Output: $15/1M tokens
+        cost = (input_tokens * 3.0 / 1_000_000) + (output_tokens * 15.0 / 1_000_000)
+        obj.spent_usd += cost
+
+        # Emit usage event
+        self.emit("objective_usage", {
+            "id": objective_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost,
+            "total_spent_usd": obj.spent_usd,
+            "total_tokens_used": obj.tokens_used
+        })
+
+        # Check token limit
+        if obj.token_limit and obj.tokens_used >= obj.token_limit:
+            raise BudgetExceededException(
+                f"Objective {objective_id} exceeded token limit: "
+                f"{obj.tokens_used} >= {obj.token_limit} tokens"
+            )
+
+        # Check budget limit
+        if obj.budget_usd and obj.spent_usd >= obj.budget_usd:
+            raise BudgetExceededException(
+                f"Objective {objective_id} exceeded budget: "
+                f"${obj.spent_usd:.4f} >= ${obj.budget_usd:.4f}"
+            )
 
     # -------------------------------------------------------------------------
     # Scheduling
@@ -857,7 +1138,67 @@ Work autonomously. Use tools as needed. When done, provide a final summary."""
         if self._current_tool_selection is not None:
             tool_inventory = f"\n\n{self._current_tool_selection.tool_inventory_summary}"
 
-        return f"""You are a helpful assistant with access to powerful tools.
+        # Get agent identity from config
+        agent_config = self.config.get("agent", {})
+        agent_name = agent_config.get("name", "Assistant")
+        agent_description = agent_config.get("description", "a helpful AI assistant")
+        agent_objective = agent_config.get("objective", "Help my owner with tasks and handle communications on their behalf.")
+
+        # Get behavior settings
+        behavior = agent_config.get("behavior", {})
+        spending_config = behavior.get("spending", {})
+        require_approval = spending_config.get("require_approval", True)
+        auto_approve_limit = spending_config.get("auto_approve_limit", 0.0)
+        accounts_config = behavior.get("accounts", {})
+        check_existing = accounts_config.get("check_existing_first", True)
+
+        # Build spending rules
+        if require_approval and auto_approve_limit > 0:
+            spending_rules = f"Auto-approve purchases under ${auto_approve_limit:.2f}. For larger amounts, consult owner first."
+        elif require_approval:
+            spending_rules = "ALWAYS consult owner before making any purchase or financial commitment."
+        else:
+            spending_rules = "You may make purchases as needed for tasks."
+
+        # Build account check rules
+        account_check_rule = ""
+        if check_existing:
+            account_check_rule = """
+BEFORE CREATING ANY ACCOUNT:
+1. Use search_credentials(query="servicename") to check if you already have an account
+2. Use memory(action="search", query="servicename") to check if you've used this service before
+3. Only create a new account if you confirm none exists"""
+
+        return f"""You are {agent_name}, {agent_description}.
+
+YOUR IDENTITY:
+- Your name is {agent_name}
+- Your purpose: {agent_objective}
+- You have your own email address via AgentMail - use get_agent_email() to retrieve it
+- You are an autonomous agent acting on behalf of your owner
+
+CRITICAL IDENTITY RULES:
+1. You have your OWN email address - ALWAYS use get_agent_email() when you need an email for signups
+2. NEVER create new email accounts (Gmail, Yahoo, Outlook, Hotmail, etc.) - you already have your own email
+3. NEVER use temporary email services (temp-mail.org, 10minutemail, guerrillamail, mailinator, etc.)
+4. When signing up for ANY service, use YOUR email from get_agent_email()
+5. Your email is for YOUR accounts - if the owner wants to create an account for themselves, ask for their email
+
+ACCOUNT CREATION WORKFLOW:
+When asked to sign up for a service or create an account:
+1. Call get_agent_email() to get YOUR email address
+2. Use browse() to navigate to the signup page
+3. Fill in the signup form using YOUR email from step 1
+4. Use wait_for_email(from_contains="servicename") to receive verification
+5. Use read_email() to get the verification link/code
+6. Complete verification with browse() or browse_with_credentials()
+7. Store credentials with store_credential(service="servicename", username="your-email", password="...")
+{account_check_rule}
+
+DISTINGUISHING ACCOUNT OWNERSHIP:
+- "Create an account" / "Sign up for X" → Use YOUR agent email (get_agent_email())
+- "Help me create an account" / "Sign me up" / "Use my email" → Ask owner for their email
+- "Create an account for me" from owner → Clarify: "Should I use my agent email, or would you like to provide your personal email?"
 
 CAPABILITIES:
 
@@ -865,6 +1206,11 @@ CAPABILITIES:
 
 2. **Background Objectives**: For immediate complex tasks, use the 'objective' tool.
    Chat continues while objectives work in the background.
+   - **Priority**: Set priority 1-10 (lower = higher priority, default 5)
+   - **Budget Control**: Set budget_usd or token_limit to cap costs
+   - **Retry**: Failed objectives retry automatically (default 3 attempts) with exponential backoff
+   - **Concurrency**: Max 5 objectives run simultaneously; others queue by priority
+   - **Cancellation**: Cancel running objectives with immediate effect
 
 3. **Scheduling**: Use the 'schedule' tool for time-based automation:
    - **One-time**: "in 5m", "in 2h", "at 2024-01-15T09:00"
@@ -882,6 +1228,34 @@ CAPABILITIES:
 8. **Secure Credentials**: Store and manage sensitive data securely.
 {status}{tool_inventory}
 
+TOOL REFERENCE:
+
+Email Operations:
+- get_agent_email() - Get YOUR email address for signups and receiving emails
+- send_email(to, subject, body) - Send email from your address
+- check_inbox(limit, unread_only) - Check for new emails
+- read_email(message_id) - Read full email content
+- wait_for_email(from_contains, subject_contains, timeout_seconds) - Wait for specific email (e.g., verification)
+
+Web Browsing:
+- browse(task, url) - General web browsing and automation
+- browse_with_credentials(task, credential_service, url) - Login using stored credentials (credentials injected securely)
+- browse_checkout(checkout_url, card_service) - Complete payment forms (card data never visible to you)
+
+Credential Management:
+- store_credential(service, username, password) - Store account credentials
+- get_credential(service, include_secrets) - Retrieve credentials (use include_secrets=False for cards)
+- list_credentials() - List all stored credentials
+- search_credentials(query) - Search credentials by service/username
+- store_secret(key, value) - Store API keys and tokens
+- get_secret(key) - Retrieve stored secrets
+
+Memory (use the memory tool):
+- memory(action="store", content="fact") - Store a fact for later recall
+- memory(action="search", query="...") - Search your memory for relevant facts
+- memory(action="list") - List recent memories
+- memory(action="find_entity", query="...", type="person/org/concept") - Find entities in knowledge graph
+
 CREDENTIAL SECURITY (CRITICAL):
 When you create accounts, obtain API keys, or handle any sensitive credentials:
 1. ALWAYS use store_credential() for usernames/passwords/account details
@@ -890,9 +1264,33 @@ When you create accounts, obtain API keys, or handle any sensitive credentials:
 4. For credit cards, use store_credential() with type="credit_card"
 
 Example: After creating an account on example.com:
-- store_credential(service="example.com", username="user@email.com", password="pass123")
+- store_credential(service="example.com", username="your-agent-email", password="pass123")
 
 This ensures credentials persist across sessions and can be retrieved later.
+
+PAYMENT SECURITY (CRITICAL):
+When handling credit card payments:
+1. NEVER ask users to share full card numbers in chat - use store_credential() with credential_type="credit_card"
+2. NEVER use get_credential(include_secrets=True) for credit cards - you don't need to see the number
+3. For checkouts, use browse_checkout(checkout_url, card_service="service_name") - it securely injects card data
+4. Use list_payment_methods() to see stored cards (shows only ****1234 format)
+5. Card numbers flow directly from keyring to browser - they are NEVER in your context
+
+SECURE PAYMENT WORKFLOW:
+1. Store card once: store_credential(service="payment", credential_type="credit_card", card_number="...", card_expiry="MM/YY", card_cvv="...", billing_name="...")
+2. For payment: browse_checkout(checkout_url="https://...", card_service="payment")
+3. The card data goes directly to the browser - you only see ****1234
+
+SPENDING AND FINANCIAL RULES:
+{spending_rules}
+- Never commit to subscriptions, paid plans, or recurring charges without explicit owner approval
+- If a "free" signup requires payment info, warn the owner before proceeding
+
+PRIVACY AND SECURITY:
+- NEVER share owner's personal information (email, phone, address, real name) with external services
+- Use YOUR agent email (get_agent_email()) for all service signups
+- If a service requires a phone number, ask owner how to proceed
+- When external parties ask about your owner, be professional but protective of their privacy
 
 WHEN TO USE SCHEDULING:
 
@@ -902,6 +1300,17 @@ Use the 'schedule' tool when the user wants something to happen:
 - On a pattern: "send me a summary every weekday at 9am" → schedule(cron)
 
 Use 'objective' for immediate background work without a time component.
+
+OBJECTIVE BEST PRACTICES:
+
+- **High priority** (1-3): Urgent tasks, time-sensitive work
+- **Normal priority** (4-6): Standard background research, reports
+- **Low priority** (7-10): Nice-to-have, exploratory tasks
+- **Budget limits**: Set budget_usd for expensive operations to prevent runaway costs
+- **Token limits**: Set token_limit for tasks that might generate excessive output
+
+Example objective with controls:
+- objective(action="spawn", goal="Research competitors", priority=2, budget_usd=0.50, max_retries=5)
 
 SCHEDULE EXAMPLES:
 - "Remind me in 30 minutes" → schedule add, spec="in 30m"
@@ -913,6 +1322,12 @@ SCHEDULE EXAMPLES:
         """Build the context-specific section of the prompt."""
         channel = context.get("channel", "cli" if is_owner else "unknown")
         verbose_info = f"- Verbose: {console.get_verbose().name.lower()} (use set_verbose tool to change)"
+
+        # Get external policy settings from config
+        agent_config = self.config.get("agent", {})
+        behavior = agent_config.get("behavior", {})
+        external_policy = behavior.get("external_policy", {})
+        consult_threshold = external_policy.get("consult_owner_threshold", "medium")
 
         if is_owner:
             return f"""
@@ -929,9 +1344,27 @@ You are speaking with your owner. You have full access to:
 - All configured communication channels
 - Full context about their preferences and history
 
-Be helpful, proactive, and casual. You know them well."""
+OWNER COMMUNICATION RULES:
+- ALWAYS respond to your owner's messages - never ignore them
+- Be helpful, proactive, and casual - you know them well
+- You can be more informal and direct with your owner
+- Proactively share relevant information they might find useful
+- If you notice issues or have concerns, bring them up"""
 
         sender = context.get("sender", "unknown")
+
+        # Build consultation rules based on threshold
+        if consult_threshold == "low":
+            consult_rules = """- Consult owner for any non-trivial request before acting
+- Only answer simple questions independently"""
+        elif consult_threshold == "high":
+            consult_rules = """- You may help with most requests independently
+- Consult owner only for major decisions (large purchases, data sharing, commitments)"""
+        else:  # medium (default)
+            consult_rules = """- You may answer questions and provide information independently
+- Consult owner before: making purchases, sharing data, scheduling meetings, making commitments
+- When in doubt, check with owner first"""
+
         return f"""
 
 CURRENT CONTEXT:
@@ -941,12 +1374,27 @@ CURRENT CONTEXT:
 - Speaking with: {sender} (external - NOT your owner)
 
 You are responding to a message from {sender}, who is NOT your owner.
-- Be helpful and professional
-- Do NOT reveal private information about your owner
-- You CAN access your memory and knowledge to be helpful
-- If you need owner input, use the objective tool to consult them
-- You can say things like "Let me check with my owner" naturally
-- Use send_message to contact your owner if needed"""
+
+EXTERNAL COMMUNICATION RULES:
+- Be helpful and professional, but prioritize your owner's interests
+- NEVER reveal owner's private information (personal email, phone, address, schedule details)
+- NEVER share owner's credentials, API keys, or sensitive business information
+- You CAN use your memory and knowledge to be helpful with general questions
+- You CAN help with information requests that don't compromise owner privacy
+
+WHEN TO CONSULT OWNER:
+{consult_rules}
+
+HOW TO CONSULT:
+- Use send_message(channel="email", to="owner", ...) to reach your owner
+- Say naturally: "Let me check with my owner and get back to you"
+- For urgent matters, indicate the urgency in your message to owner
+
+RESPONDING TO EXTERNAL REQUESTS:
+- Spam or clearly automated messages: You may ignore these
+- Legitimate inquiries: Respond professionally, consult owner if needed
+- Requests for owner info: Politely decline, offer to relay a message instead
+- Meeting/call requests: "I'll check my owner's availability and get back to you\""""
 
     def _tool_schemas(self) -> list:
         """Get tool schemas for API calls.
@@ -979,6 +1427,142 @@ You are responding to a message from {sender}, who is NOT your owner.
 
     def clear_thread(self, thread_id: str = "main"):
         self.threads[thread_id] = []
+
+    # -------------------------------------------------------------------------
+    # Memory Convenience Methods
+    # -------------------------------------------------------------------------
+
+    def memory_recall(self, query: str) -> dict:
+        """
+        Search memory for information matching the query.
+
+        This is a convenience method for dynamic tools and external code.
+        It works whether enhanced memory is enabled or not.
+
+        Args:
+            query: Search query string
+
+        Returns:
+            dict with "memories" list of matching results, or "error" on failure
+        """
+        if self.memory is not None:
+            try:
+                events = self.memory.search_events(query, limit=10)
+                return {
+                    "memories": [
+                        {
+                            "content": e.content[:500] if e.content else "",
+                            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                            "channel": getattr(e, "channel", None),
+                        }
+                        for e in events
+                    ]
+                }
+            except Exception as e:
+                return {"error": f"Memory search failed: {e}"}
+        else:
+            # Fallback to simple in-memory search
+            query_lower = query.lower()
+            matches = [m for m in MEMORIES if query_lower in m.get("content", "").lower()]
+            return {"memories": matches[-10:]}
+
+    def memory_store(self, content: str) -> dict:
+        """
+        Store a fact or observation in memory.
+
+        This is a convenience method for dynamic tools and external code.
+        It works whether enhanced memory is enabled or not.
+
+        Args:
+            content: The fact or observation to store
+
+        Returns:
+            dict with "stored": True on success, or "error" on failure
+        """
+        if self.memory is not None:
+            try:
+                event = self.memory.log_event(
+                    content=content,
+                    event_type="observation",
+                    channel=None,
+                    direction="internal",
+                    is_owner=True,
+                )
+                return {"stored": True, "event_id": event.id}
+            except Exception as e:
+                return {"error": f"Memory store failed: {e}"}
+        else:
+            # Fallback to simple in-memory storage
+            memory = {"content": content, "ts": datetime.now().isoformat()}
+            MEMORIES.append(memory)
+            return {"stored": True}
+
+    # -------------------------------------------------------------------------
+    # Thread Repair
+    # -------------------------------------------------------------------------
+
+    def repair_thread(self, thread_id: str = "main") -> dict:
+        """
+        Repair a corrupted thread by fixing orphaned tool_use blocks.
+
+        The Anthropic API requires every tool_use block to have a matching
+        tool_result. If tool execution crashes, the thread can be left in
+        a corrupted state with tool_use but no tool_result.
+
+        This method scans the thread and adds error tool_results for any
+        orphaned tool_use blocks.
+
+        Args:
+            thread_id: The thread to repair
+
+        Returns:
+            dict with repair statistics
+        """
+        thread = self.threads.get(thread_id)
+        if not thread:
+            return {"repaired": 0, "message": "Thread not found or empty"}
+
+        # Find all tool_use IDs that need results
+        pending_tool_use_ids = set()
+        repaired_count = 0
+
+        for msg in thread:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            pending_tool_use_ids.add(block.get("id"))
+                        elif hasattr(block, "type") and block.type == "tool_use":
+                            pending_tool_use_ids.add(block.id)
+
+            elif msg.get("role") == "user":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            pending_tool_use_ids.discard(block.get("tool_use_id"))
+
+        # If there are orphaned tool_use blocks, add error results
+        if pending_tool_use_ids:
+            error_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": json.dumps({
+                        "error": "Tool execution failed - thread repaired",
+                        "repaired": True
+                    })
+                }
+                for tool_id in pending_tool_use_ids
+            ]
+            thread.append({"role": "user", "content": error_results})
+            repaired_count = len(pending_tool_use_ids)
+
+        return {
+            "repaired": repaired_count,
+            "message": f"Repaired {repaired_count} orphaned tool_use block(s)" if repaired_count else "Thread is healthy"
+        }
 
 
 # =============================================================================
@@ -1035,28 +1619,55 @@ def _objective_tool(agent: Agent) -> Tool:
 
         if action == "spawn":
             obj_id = str(uuid.uuid4())[:8]
+            priority = params.get("priority", 5)
+            budget_usd = params.get("budget_usd")
+            token_limit = params.get("token_limit")
+            max_retries = params.get("max_retries", 3)
+
             obj = Objective(
                 id=obj_id,
                 goal=params["goal"],
-                schedule=params.get("schedule")
+                schedule=params.get("schedule"),
+                priority=priority,
+                budget_usd=budget_usd,
+                token_limit=token_limit,
+                max_retries=max_retries
             )
             ag.objectives[obj_id] = obj
+
+            # Add to priority queue
+            heapq.heappush(ag._objective_queue, (priority, time.time(), obj_id))
+
             # Start in background on main event loop (safe from thread pool)
             if not ag._spawn_background_task(ag.run_objective(obj_id)):
                 del ag.objectives[obj_id]
                 return {"error": "Agent not initialized (no event loop)"}
+
             return {
                 "spawned": obj_id,
                 "goal": obj.goal,
                 "schedule": obj.schedule,
+                "priority": obj.priority,
+                "budget_usd": obj.budget_usd,
+                "token_limit": obj.token_limit,
+                "max_retries": obj.max_retries,
                 "message": "Objective started in background. Chat can continue."
             }
 
         elif action == "list":
             return {"objectives": [
-                {"id": o.id, "goal": o.goal, "status": o.status,
-                 "schedule": o.schedule, "result": o.result[:200] if o.result else None}
-                for o in ag.objectives.values()
+                {
+                    "id": o.id,
+                    "goal": o.goal,
+                    "status": o.status,
+                    "priority": o.priority,
+                    "schedule": o.schedule,
+                    "retry_count": o.retry_count,
+                    "spent_usd": round(o.spent_usd, 6),
+                    "tokens_used": o.tokens_used,
+                    "result": o.result[:200] if o.result else None
+                }
+                for o in sorted(ag.objectives.values(), key=lambda x: (x.priority, x.created))
             ]}
 
         elif action == "check":
@@ -1065,37 +1676,68 @@ def _objective_tool(agent: Agent) -> Tool:
             if not obj:
                 return {"error": f"Objective {obj_id} not found"}
             return {
-                "id": obj.id, "goal": obj.goal, "status": obj.status,
-                "result": obj.result, "error": obj.error
+                "id": obj.id,
+                "goal": obj.goal,
+                "status": obj.status,
+                "priority": obj.priority,
+                "result": obj.result,
+                "error": obj.error,
+                "retry_count": obj.retry_count,
+                "max_retries": obj.max_retries,
+                "last_error": obj.last_error,
+                "budget_usd": obj.budget_usd,
+                "spent_usd": round(obj.spent_usd, 6),
+                "token_limit": obj.token_limit,
+                "tokens_used": obj.tokens_used,
+                "created": obj.created,
+                "completed": obj.completed
             }
 
         elif action == "cancel":
             obj_id = params["id"]
             obj = ag.objectives.get(obj_id)
-            if obj:
-                obj.status = "cancelled"
-                return {"cancelled": obj_id}
-            return {"error": f"Objective {obj_id} not found"}
+            if not obj:
+                return {"error": f"Objective {obj_id} not found"}
+
+            # Signal cancellation token
+            if obj_id in ag._cancellation_tokens:
+                ag._cancellation_tokens[obj_id].set()
+
+            obj.status = "cancelled"
+            return {
+                "cancelled": obj_id,
+                "message": "Cancellation signal sent. Running objective will stop at next checkpoint."
+            }
 
         return {"error": f"Unknown action: {action}"}
 
     return Tool(
         name="objective",
-        description="""Manage background objectives (async work).
+        description="""Manage background objectives (async work) with priority, retry, and budget controls.
 
 Actions:
-- spawn: Create new objective (goal, optional schedule like 'hourly', 'daily', 'every 5 minutes')
-- list: See all objectives and their status
-- check: Get details of specific objective (id)
-- cancel: Stop an objective (id)
+- spawn: Create new objective with options:
+  - goal: What to accomplish (required)
+  - priority: 1-10, lower = higher priority (default: 5)
+  - schedule: Recurring schedule like 'hourly', 'daily', 'every 5 minutes'
+  - budget_usd: Maximum cost allowed (stops if exceeded)
+  - token_limit: Maximum tokens allowed (stops if exceeded)
+  - max_retries: Number of retry attempts on failure (default: 3)
+- list: See all objectives sorted by priority, with status and cost tracking
+- check: Get full details of specific objective (id)
+- cancel: Stop an objective (id) - sends cancellation signal
 
-Use spawn for complex/time-consuming tasks. The objective runs in background while chat continues.""",
+Max 5 concurrent objectives. Higher priority objectives run first. Failed objectives retry with exponential backoff.""",
         parameters={
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["spawn", "list", "check", "cancel"]},
                 "goal": {"type": "string", "description": "What to accomplish (for spawn)"},
                 "schedule": {"type": "string", "description": "Recurring schedule (for spawn)"},
+                "priority": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Priority 1-10, lower = higher (for spawn)"},
+                "budget_usd": {"type": "number", "description": "Maximum cost in USD (for spawn)"},
+                "token_limit": {"type": "integer", "description": "Maximum tokens allowed (for spawn)"},
+                "max_retries": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Retry attempts on failure (for spawn)"},
                 "id": {"type": "string", "description": "Objective ID (for check/cancel)"}
             },
             "required": ["action"]
@@ -1700,6 +2342,24 @@ Be concise. Mention what you can help with based on available tools. If any tool
         print("\nGoodbye!")
     finally:
         scheduler_task.cancel()
+
+
+# ═══════════════════════════════════════════════════════════
+# GLOBAL METRICS ACCESSOR
+# ═══════════════════════════════════════════════════════════
+
+_metrics_collector_instance: MetricsCollector | None = None
+
+
+def _set_metrics_collector(collector: MetricsCollector):
+    """Set the global metrics collector instance."""
+    global _metrics_collector_instance
+    _metrics_collector_instance = collector
+
+
+def _get_metrics_collector() -> MetricsCollector | None:
+    """Get the global metrics collector instance for tool access."""
+    return _metrics_collector_instance
 
 
 def main():

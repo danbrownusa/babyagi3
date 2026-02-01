@@ -21,6 +21,7 @@ from .models import (
     Entity,
     Event,
     EventTopic,
+    Learning,
     SummaryNode,
     Task,
     ToolDefinition,
@@ -147,8 +148,35 @@ class MemoryStore:
         """Initialize the database schema."""
         self._create_tables()
         self._create_indices()
+        self._migrate_tool_definitions()
         self._ensure_root_node()
         self._ensure_agent_state()
+
+    def _migrate_tool_definitions(self):
+        """Add new columns to tool_definitions for skills and composio support."""
+        cur = self.conn.cursor()
+
+        # Get existing columns
+        cur.execute("PRAGMA table_info(tool_definitions)")
+        existing_columns = {row["name"] for row in cur.fetchall()}
+
+        # Add new columns if they don't exist
+        migrations = [
+            ("tool_type", "TEXT DEFAULT 'executable'"),
+            ("skill_content", "TEXT"),
+            ("composio_app", "TEXT"),
+            ("composio_action", "TEXT"),
+            ("depends_on", "TEXT"),
+        ]
+
+        for col_name, col_def in migrations:
+            if col_name not in existing_columns:
+                try:
+                    cur.execute(f"ALTER TABLE tool_definitions ADD COLUMN {col_name} {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # Column might already exist
+
+        self.conn.commit()
 
     def _create_tables(self):
         """Create all tables."""
@@ -331,12 +359,25 @@ class MemoryStore:
                 name TEXT NOT NULL UNIQUE,
                 description TEXT NOT NULL,
 
+                -- Tool type: "executable", "skill", "composio"
+                tool_type TEXT DEFAULT 'executable',
+
                 -- Definition (what makes it executable)
                 source_code TEXT,
                 parameters TEXT,
                 packages TEXT,
                 env TEXT,
                 tool_var_name TEXT,
+
+                -- For skills
+                skill_content TEXT,
+
+                -- For composio tools
+                composio_app TEXT,
+                composio_action TEXT,
+
+                -- Dependencies (JSON list of tool names this depends on)
+                depends_on TEXT,
 
                 -- Category
                 category TEXT DEFAULT 'custom',
@@ -429,6 +470,81 @@ class MemoryStore:
         """
         )
 
+        # Metrics tables
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_calls (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT NOT NULL,
+                thread_id TEXT,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                stop_reason TEXT
+            )
+        """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embedding_calls (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                text_count INTEGER NOT NULL,
+                token_estimate INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                cached INTEGER NOT NULL DEFAULT 0
+            )
+        """
+        )
+
+        # Learnings table - for self-improvement system
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS learnings (
+                id TEXT PRIMARY KEY,
+
+                -- Source
+                source_type TEXT NOT NULL,
+                source_event_id TEXT,
+
+                -- Content
+                content TEXT NOT NULL,
+                content_embedding BLOB,
+
+                -- Classification
+                sentiment TEXT NOT NULL DEFAULT 'neutral',
+                confidence REAL DEFAULT 0.5,
+
+                -- Associations
+                tool_id TEXT,
+                topic_ids TEXT,
+                objective_type TEXT,
+                entity_ids TEXT,
+
+                -- Actionable insight
+                applies_when TEXT,
+                recommendation TEXT,
+
+                -- Stats
+                times_applied INTEGER DEFAULT 0,
+                last_applied_at TEXT,
+
+                -- Timestamps
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+
+                FOREIGN KEY (source_event_id) REFERENCES events(id)
+            )
+        """
+        )
+
         self.conn.commit()
 
     def _create_indices(self):
@@ -458,12 +574,27 @@ class MemoryStore:
             # Tool definitions indices
             "CREATE INDEX IF NOT EXISTS idx_tool_definitions_name ON tool_definitions(name)",
             "CREATE INDEX IF NOT EXISTS idx_tool_definitions_enabled ON tool_definitions(is_enabled)",
-            # Credentials indices
-            "CREATE INDEX IF NOT EXISTS idx_credentials_service ON credentials(service)",
-            "CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(credential_type)",
             "CREATE INDEX IF NOT EXISTS idx_tool_definitions_dynamic ON tool_definitions(is_dynamic)",
             "CREATE INDEX IF NOT EXISTS idx_tool_definitions_category ON tool_definitions(category)",
             "CREATE INDEX IF NOT EXISTS idx_tool_definitions_error_count ON tool_definitions(error_count DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_tool_definitions_tool_type ON tool_definitions(tool_type)",
+            "CREATE INDEX IF NOT EXISTS idx_tool_definitions_composio_app ON tool_definitions(composio_app)",
+            # Credentials indices
+            "CREATE INDEX IF NOT EXISTS idx_credentials_service ON credentials(service)",
+            "CREATE INDEX IF NOT EXISTS idx_credentials_type ON credentials(credential_type)",
+            # Metrics indices
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_timestamp ON llm_calls(timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_source ON llm_calls(source)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_model ON llm_calls(model)",
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_thread ON llm_calls(thread_id)",
+            "CREATE INDEX IF NOT EXISTS idx_embedding_calls_timestamp ON embedding_calls(timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_embedding_calls_model ON embedding_calls(model)",
+            # Learnings indices
+            "CREATE INDEX IF NOT EXISTS idx_learnings_tool ON learnings(tool_id)",
+            "CREATE INDEX IF NOT EXISTS idx_learnings_objective_type ON learnings(objective_type)",
+            "CREATE INDEX IF NOT EXISTS idx_learnings_sentiment ON learnings(sentiment)",
+            "CREATE INDEX IF NOT EXISTS idx_learnings_source_type ON learnings(source_type)",
+            "CREATE INDEX IF NOT EXISTS idx_learnings_created_at ON learnings(created_at DESC)",
         ]
 
         for idx in indices:
@@ -1534,17 +1665,31 @@ class MemoryStore:
         )
         self.conn.commit()
 
-    def increment_staleness(self, node_id: str):
-        """Increment staleness counter for a node."""
+    def increment_staleness(self, node_id_or_key: str):
+        """Increment staleness counter for a node by ID or key."""
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            UPDATE summary_nodes
-            SET events_since_update = events_since_update + 1, updated_at = ?
-            WHERE id = ?
-        """,
-            (now_iso(), node_id),
-        )
+
+        # Check if it's a key (contains ':' or is a known key like 'root', 'user_preferences')
+        if ":" in node_id_or_key or node_id_or_key in ("root", "user_preferences"):
+            # It's a key, look up by key
+            cur.execute(
+                """
+                UPDATE summary_nodes
+                SET events_since_update = events_since_update + 1, updated_at = ?
+                WHERE key = ?
+            """,
+                (now_iso(), node_id_or_key),
+            )
+        else:
+            # It's an ID
+            cur.execute(
+                """
+                UPDATE summary_nodes
+                SET events_since_update = events_since_update + 1, updated_at = ?
+                WHERE id = ?
+            """,
+                (now_iso(), node_id_or_key),
+            )
         self.conn.commit()
 
     def _row_to_summary_node(self, row: sqlite3.Row) -> SummaryNode:
@@ -1653,12 +1798,25 @@ class MemoryStore:
         category: str = "custom",
         is_dynamic: bool = True,
         created_by_event_id: str | None = None,
+        # New fields for skills and composio
+        tool_type: str = "executable",
+        skill_content: str | None = None,
+        composio_app: str | None = None,
+        composio_action: str | None = None,
+        depends_on: list[str] | None = None,
     ) -> ToolDefinition:
         """
         Save or update a tool definition.
 
         If a tool with this name exists, updates it (increments version).
         Otherwise creates a new tool definition.
+
+        Args:
+            tool_type: "executable" (default), "skill", or "composio"
+            skill_content: For skills - the SKILL.md markdown instructions
+            composio_app: For composio - app name like "SLACK", "GITHUB"
+            composio_action: For composio - action name like "SLACK_SEND_MESSAGE"
+            depends_on: List of tool names this tool depends on
         """
         cur = self.conn.cursor()
         now = now_iso()
@@ -1674,11 +1832,16 @@ class MemoryStore:
                 """
                 UPDATE tool_definitions SET
                     description = ?,
+                    tool_type = ?,
                     source_code = ?,
                     parameters = ?,
                     packages = ?,
                     env = ?,
                     tool_var_name = ?,
+                    skill_content = ?,
+                    composio_app = ?,
+                    composio_action = ?,
+                    depends_on = ?,
                     category = ?,
                     is_dynamic = ?,
                     version = ?,
@@ -1687,11 +1850,16 @@ class MemoryStore:
             """,
                 (
                     description,
+                    tool_type,
                     source_code,
                     serialize_json(parameters),
                     serialize_json(packages or []),
                     serialize_json(env or []),
                     tool_var_name,
+                    skill_content,
+                    composio_app,
+                    composio_action,
+                    serialize_json(depends_on or []),
                     category,
                     1 if is_dynamic else 0,
                     new_version,
@@ -1724,21 +1892,27 @@ class MemoryStore:
         cur.execute(
             """
             INSERT INTO tool_definitions (
-                id, name, description, source_code, parameters, packages, env,
-                tool_var_name, category, is_enabled, is_dynamic,
+                id, name, description, tool_type, source_code, parameters, packages, env,
+                tool_var_name, skill_content, composio_app, composio_action, depends_on,
+                category, is_enabled, is_dynamic,
                 entity_id, summary_node_id, created_by_event_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
         """,
             (
                 tool_id,
                 name,
                 description,
+                tool_type,
                 source_code,
                 serialize_json(parameters),
                 serialize_json(packages or []),
                 serialize_json(env or []),
                 tool_var_name,
+                skill_content,
+                composio_app,
+                composio_action,
+                serialize_json(depends_on or []),
                 category,
                 1 if is_dynamic else 0,
                 entity.id,
@@ -1754,11 +1928,16 @@ class MemoryStore:
             id=tool_id,
             name=name,
             description=description,
+            tool_type=tool_type,
             source_code=source_code,
             parameters=parameters,
             packages=packages or [],
             env=env or [],
             tool_var_name=tool_var_name,
+            skill_content=skill_content,
+            composio_app=composio_app,
+            composio_action=composio_action,
+            depends_on=depends_on or [],
             category=category,
             is_enabled=True,
             is_dynamic=is_dynamic,
@@ -1825,6 +2004,67 @@ class MemoryStore:
             ORDER BY name
         """,
             (category,),
+        )
+        return [self._row_to_tool_definition(row) for row in cur.fetchall()]
+
+    def get_tools_by_type(self, tool_type: str, enabled_only: bool = True) -> list[ToolDefinition]:
+        """Get all tools of a specific type (executable, skill, composio)."""
+        cur = self.conn.cursor()
+        if enabled_only:
+            cur.execute(
+                """
+                SELECT * FROM tool_definitions
+                WHERE tool_type = ? AND is_enabled = 1
+                ORDER BY name
+            """,
+                (tool_type,),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM tool_definitions WHERE tool_type = ? ORDER BY name",
+                (tool_type,),
+            )
+        return [self._row_to_tool_definition(row) for row in cur.fetchall()]
+
+    def get_skills(self, enabled_only: bool = True) -> list[ToolDefinition]:
+        """Get all skill-type tools."""
+        return self.get_tools_by_type("skill", enabled_only)
+
+    def get_composio_tools(self, app: str | None = None, enabled_only: bool = True) -> list[ToolDefinition]:
+        """Get all composio-type tools, optionally filtered by app."""
+        cur = self.conn.cursor()
+        if app:
+            if enabled_only:
+                cur.execute(
+                    """
+                    SELECT * FROM tool_definitions
+                    WHERE tool_type = 'composio' AND composio_app = ? AND is_enabled = 1
+                    ORDER BY name
+                """,
+                    (app,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM tool_definitions
+                    WHERE tool_type = 'composio' AND composio_app = ?
+                    ORDER BY name
+                """,
+                    (app,),
+                )
+        else:
+            return self.get_tools_by_type("composio", enabled_only)
+        return [self._row_to_tool_definition(row) for row in cur.fetchall()]
+
+    def get_tools_with_dependencies(self) -> list[ToolDefinition]:
+        """Get all tools that have dependencies on other tools."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT * FROM tool_definitions
+            WHERE depends_on IS NOT NULL AND depends_on != '[]' AND is_enabled = 1
+            ORDER BY name
+        """
         )
         return [self._row_to_tool_definition(row) for row in cur.fetchall()]
 
@@ -2104,15 +2344,23 @@ class MemoryStore:
 
     def _row_to_tool_definition(self, row: sqlite3.Row) -> ToolDefinition:
         """Convert a database row to a ToolDefinition."""
+        # Handle potentially missing columns for backward compatibility
+        row_dict = dict(row)
+
         return ToolDefinition(
             id=row["id"],
             name=row["name"],
             description=row["description"],
+            tool_type=row_dict.get("tool_type") or "executable",
             source_code=row["source_code"],
             parameters=deserialize_json(row["parameters"]) or {},
             packages=deserialize_json(row["packages"]) or [],
             env=deserialize_json(row["env"]) or [],
             tool_var_name=row["tool_var_name"],
+            skill_content=row_dict.get("skill_content"),
+            composio_app=row_dict.get("composio_app"),
+            composio_action=row_dict.get("composio_action"),
+            depends_on=deserialize_json(row_dict.get("depends_on")) or [],
             category=row["category"],
             is_enabled=bool(row["is_enabled"]),
             is_dynamic=bool(row["is_dynamic"]),
@@ -2611,6 +2859,422 @@ class MemoryStore:
             updated_at=parse_datetime(row["updated_at"]),
             last_used_at=parse_datetime(row["last_used_at"]),
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # LEARNINGS (Self-Improvement System)
+    # ═══════════════════════════════════════════════════════════
+
+    def create_learning(self, learning: Learning) -> Learning:
+        """Create a new learning from feedback or evaluation."""
+        cur = self.conn.cursor()
+        now = now_iso()
+
+        # Ensure ID exists
+        if not learning.id:
+            learning.id = generate_id()
+
+        cur.execute(
+            """
+            INSERT INTO learnings
+            (id, source_type, source_event_id, content, content_embedding,
+             sentiment, confidence, tool_id, topic_ids, objective_type,
+             entity_ids, applies_when, recommendation, times_applied,
+             last_applied_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                learning.id,
+                learning.source_type,
+                learning.source_event_id,
+                learning.content,
+                serialize_embedding(learning.content_embedding),
+                learning.sentiment,
+                learning.confidence,
+                learning.tool_id,
+                serialize_json(learning.topic_ids),
+                learning.objective_type,
+                serialize_json(learning.entity_ids),
+                learning.applies_when,
+                learning.recommendation,
+                learning.times_applied,
+                learning.last_applied_at.isoformat() if learning.last_applied_at else None,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return learning
+
+    def get_learning(self, learning_id: str) -> Learning | None:
+        """Get a learning by ID."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM learnings WHERE id = ?", (learning_id,))
+        row = cur.fetchone()
+        return self._row_to_learning(row) if row else None
+
+    def find_learnings(
+        self,
+        tool_id: str | None = None,
+        objective_type: str | None = None,
+        sentiment: str | None = None,
+        source_type: str | None = None,
+        limit: int = 20,
+    ) -> list[Learning]:
+        """Find learnings by filters."""
+        cur = self.conn.cursor()
+
+        query = "SELECT * FROM learnings WHERE 1=1"
+        params = []
+
+        if tool_id:
+            query += " AND tool_id = ?"
+            params.append(tool_id)
+        if objective_type:
+            query += " AND objective_type = ?"
+            params.append(objective_type)
+        if sentiment:
+            query += " AND sentiment = ?"
+            params.append(sentiment)
+        if source_type:
+            query += " AND source_type = ?"
+            params.append(source_type)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        cur.execute(query, params)
+        return [self._row_to_learning(row) for row in cur.fetchall()]
+
+    def search_learnings(
+        self,
+        embedding: list[float],
+        tool_id: str | None = None,
+        objective_type: str | None = None,
+        limit: int = 10,
+    ) -> list[Learning]:
+        """Search learnings by vector similarity.
+
+        Uses cosine similarity on content_embedding.
+        Falls back to recent learnings if no embeddings available.
+        """
+        cur = self.conn.cursor()
+
+        # Build filter conditions
+        conditions = ["content_embedding IS NOT NULL"]
+        params = []
+
+        if tool_id:
+            conditions.append("tool_id = ?")
+            params.append(tool_id)
+        if objective_type:
+            conditions.append("objective_type = ?")
+            params.append(objective_type)
+
+        where_clause = " AND ".join(conditions)
+
+        cur.execute(f"SELECT * FROM learnings WHERE {where_clause}", params)
+        rows = cur.fetchall()
+
+        if not rows:
+            # Fallback to recent learnings without embeddings
+            return self.find_learnings(
+                tool_id=tool_id,
+                objective_type=objective_type,
+                limit=limit,
+            )
+
+        # Calculate similarities and sort
+        scored = []
+        for row in rows:
+            row_embedding = deserialize_embedding(row["content_embedding"])
+            if row_embedding:
+                similarity = self._cosine_similarity(embedding, row_embedding)
+                scored.append((similarity, row))
+
+        # Sort by similarity descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        return [self._row_to_learning(row) for _, row in scored[:limit]]
+
+    def get_learnings_for_tool(self, tool_id: str, limit: int = 5) -> list[Learning]:
+        """Get learnings specific to a tool, prioritizing corrections."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT * FROM learnings
+            WHERE tool_id = ?
+            ORDER BY
+                CASE sentiment WHEN 'negative' THEN 0 ELSE 1 END,
+                created_at DESC
+            LIMIT ?
+        """,
+            (tool_id, limit),
+        )
+        return [self._row_to_learning(row) for row in cur.fetchall()]
+
+    def get_all_learnings(self, limit: int = 100) -> list[Learning]:
+        """Get all learnings, ordered by recency."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT * FROM learnings ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [self._row_to_learning(row) for row in cur.fetchall()]
+
+    def record_learning_applied(self, learning_id: str):
+        """Record that a learning was used in context."""
+        cur = self.conn.cursor()
+        now = now_iso()
+        cur.execute(
+            """
+            UPDATE learnings
+            SET times_applied = times_applied + 1,
+                last_applied_at = ?,
+                updated_at = ?
+            WHERE id = ?
+        """,
+            (now, now, learning_id),
+        )
+        self.conn.commit()
+
+    def delete_learning(self, learning_id: str) -> bool:
+        """Delete a learning by ID."""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM learnings WHERE id = ?", (learning_id,))
+        deleted = cur.rowcount > 0
+        self.conn.commit()
+        return deleted
+
+    def get_learning_stats(self) -> dict:
+        """Get aggregate statistics about learnings."""
+        cur = self.conn.cursor()
+
+        cur.execute("SELECT COUNT(*) as total FROM learnings")
+        total = cur.fetchone()["total"]
+
+        cur.execute(
+            """
+            SELECT sentiment, COUNT(*) as count
+            FROM learnings
+            GROUP BY sentiment
+        """
+        )
+        by_sentiment = {row["sentiment"]: row["count"] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT source_type, COUNT(*) as count
+            FROM learnings
+            GROUP BY source_type
+        """
+        )
+        by_source = {row["source_type"]: row["count"] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT tool_id, COUNT(*) as count
+            FROM learnings
+            WHERE tool_id IS NOT NULL
+            GROUP BY tool_id
+            ORDER BY count DESC
+            LIMIT 10
+        """
+        )
+        by_tool = {row["tool_id"]: row["count"] for row in cur.fetchall()}
+
+        return {
+            "total": total,
+            "by_sentiment": by_sentiment,
+            "by_source": by_source,
+            "by_tool": by_tool,
+        }
+
+    def _row_to_learning(self, row: sqlite3.Row) -> Learning:
+        """Convert a database row to a Learning."""
+        return Learning(
+            id=row["id"],
+            source_type=row["source_type"],
+            source_event_id=row["source_event_id"],
+            content=row["content"],
+            content_embedding=deserialize_embedding(row["content_embedding"]),
+            sentiment=row["sentiment"],
+            confidence=row["confidence"],
+            tool_id=row["tool_id"],
+            topic_ids=deserialize_json(row["topic_ids"]) or [],
+            objective_type=row["objective_type"],
+            entity_ids=deserialize_json(row["entity_ids"]) or [],
+            applies_when=row["applies_when"],
+            recommendation=row["recommendation"],
+            times_applied=row["times_applied"],
+            last_applied_at=parse_datetime(row["last_applied_at"]),
+            created_at=parse_datetime(row["created_at"]),
+            updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        """Calculate cosine similarity between two vectors."""
+        if len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(x * x for x in b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    # ═══════════════════════════════════════════════════════════
+    # METRICS
+    # ═══════════════════════════════════════════════════════════
+
+    def record_llm_call(self, metric) -> None:
+        """
+        Record an LLM API call metric.
+
+        Args:
+            metric: LLMCallMetric instance from metrics.models
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO llm_calls
+            (id, timestamp, source, model, thread_id, input_tokens,
+             output_tokens, cost_usd, duration_ms, stop_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                metric.id,
+                metric.timestamp.isoformat(),
+                metric.source,
+                metric.model,
+                metric.thread_id,
+                metric.input_tokens,
+                metric.output_tokens,
+                metric.cost_usd,
+                metric.duration_ms,
+                metric.stop_reason,
+            ),
+        )
+        self.conn.commit()
+
+    def record_embedding_call(self, metric) -> None:
+        """
+        Record an embedding API call metric.
+
+        Args:
+            metric: EmbeddingCallMetric instance from metrics.models
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO embedding_calls
+            (id, timestamp, provider, model, text_count,
+             token_estimate, cost_usd, duration_ms, cached)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                metric.id,
+                metric.timestamp.isoformat(),
+                metric.provider,
+                metric.model,
+                metric.text_count,
+                metric.token_estimate,
+                metric.cost_usd,
+                metric.duration_ms,
+                1 if metric.cached else 0,
+            ),
+        )
+        self.conn.commit()
+
+    def get_llm_call_stats(
+        self,
+        source: str | None = None,
+        since: str | None = None,
+    ) -> dict:
+        """
+        Get aggregated LLM call statistics.
+
+        Args:
+            source: Filter by source (optional)
+            since: ISO timestamp to filter from (optional)
+
+        Returns:
+            Dict with call_count, total_tokens, total_cost, avg_latency_ms
+        """
+        cur = self.conn.cursor()
+
+        query = "SELECT * FROM llm_calls WHERE 1=1"
+        params = []
+
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "call_count": 0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "avg_latency_ms": 0.0,
+            }
+
+        total_tokens = sum(r["input_tokens"] + r["output_tokens"] for r in rows)
+        total_cost = sum(r["cost_usd"] for r in rows)
+        total_latency = sum(r["duration_ms"] for r in rows)
+
+        return {
+            "call_count": len(rows),
+            "total_tokens": total_tokens,
+            "total_cost": total_cost,
+            "avg_latency_ms": total_latency / len(rows),
+        }
+
+    def get_embedding_call_stats(self, since: str | None = None) -> dict:
+        """
+        Get aggregated embedding call statistics.
+
+        Args:
+            since: ISO timestamp to filter from (optional)
+
+        Returns:
+            Dict with call_count, text_count, total_cost, cache_hit_rate
+        """
+        cur = self.conn.cursor()
+
+        query = "SELECT * FROM embedding_calls WHERE 1=1"
+        params = []
+
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "call_count": 0,
+                "text_count": 0,
+                "total_cost": 0.0,
+                "cache_hit_rate": 0.0,
+            }
+
+        cached_count = sum(1 for r in rows if r["cached"])
+        text_count = sum(r["text_count"] for r in rows)
+        total_cost = sum(r["cost_usd"] for r in rows)
+
+        return {
+            "call_count": len(rows),
+            "text_count": text_count,
+            "total_cost": total_cost,
+            "cache_hit_rate": cached_count / len(rows) * 100,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # CLOSE

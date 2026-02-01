@@ -19,6 +19,21 @@ This means the entire system reduces to: **a loop that processes messages and de
 
 ## What's New in v0.3.0
 
+- **Graph-Based Memory** — SQLite-backed persistent memory with entity extraction, relationship tracking, and semantic search
+- **Smart Tool Selection** — Intelligent context-aware tool filtering to manage growing tool inventories
+- **Tool Self-Improvement** — Dynamically created tools persist across restarts with usage statistics and health tracking
+- **Objective Concurrency Control** — Max 5 concurrent objectives with semaphore-based limiting
+- **Priority Queue** — Objectives support priority 1-10 (lower = higher); higher priority runs first
+- **Retry with Backoff** — Failed objectives retry automatically with exponential backoff (2s, 4s, 8s)
+- **Budget Controls** — Set `budget_usd` or `token_limit` per objective to cap costs
+- **True Cancellation** — Cancel signals propagate to running objectives immediately
+- **Metrics & Cost Tracking** — Automatic tracking of API usage, costs, and tool performance
+- **Thread Repair** — Automatic repair of corrupted message threads from failed tool executions
+
+### Previous (v0.2.0)
+
+- **Skills System** — Learn new behaviors from SKILL.md files with safety scanning
+- **Composio Integration** — Connect to 250+ apps (Slack, GitHub, Notion) via OAuth
 - **Multi-Channel Architecture** — Receive messages from CLI, email, voice, and more
 - **Full-Featured Scheduler** — Cron expressions, intervals, one-time tasks with persistence
 - **Styled CLI Output** — Color-coded messages (user/agent/system) with verbose modes
@@ -127,6 +142,32 @@ Tool {
   env: list[str]       # Required env vars
 }
 
+ToolDefinition {
+  id: string
+  name: string
+  description: string
+  tool_type: "executable" | "skill" | "composio"
+
+  # For executable tools
+  source_code: string | None
+  parameters: json_schema
+  packages: list[str]
+
+  # For skills
+  skill_content: string | None  # SKILL.md markdown
+
+  # For composio tools
+  composio_app: string | None   # "SLACK", "GITHUB"
+  composio_action: string | None
+
+  # Dependencies
+  depends_on: list[str]  # Other tools/skills
+
+  # Stats
+  usage_count: int
+  success_rate: float
+}
+
 Thread {
   id: string
   messages: Message[]
@@ -135,11 +176,21 @@ Thread {
 Objective {
   id: string
   goal: string
-  status: "pending" | "running" | "completed" | "failed"
+  status: "pending" | "running" | "completed" | "failed" | "cancelled"
   thread_id: string
   schedule: string | None
   result: string | None
   error: string | None
+  # Priority and resource controls
+  priority: int  # 1-10, lower = higher priority (default 5)
+  retry_count: int  # Current retry attempt
+  max_retries: int  # Max retry attempts (default 3)
+  last_error: string | None  # Error from last failed attempt
+  # Budget tracking
+  budget_usd: float | None  # Max cost allowed
+  spent_usd: float  # Total cost so far
+  token_limit: int | None  # Max tokens allowed
+  tokens_used: int  # Total tokens used
 }
 
 Schedule {
@@ -236,6 +287,10 @@ export BROWSER_USE_API_KEY="your-browser-use-key"
 
 # For dynamic tool sandboxing
 export E2B_API_KEY="your-e2b-key"
+
+# For Composio integrations (250+ apps)
+pip install composio-core
+composio login  # or set COMPOSIO_API_KEY
 
 # For voice channel (install separately)
 pip install sounddevice numpy openai-whisper pyttsx3
@@ -390,7 +445,7 @@ and returns the result.
 
 ### Memory Tool
 
-Append-only log with search capability.
+Persistent memory with semantic search, entity extraction, and knowledge graph capabilities.
 
 ```python
 # Store a memory
@@ -401,12 +456,45 @@ agent.run("What's the server IP?")
 
 # List recent memories
 agent.run("Show me my recent memories")
+
+# Find entities in the knowledge graph
+agent.run("What do I know about John Smith?")
+
+# Get a summary of what you know about a topic
+agent.run("Summarize what you know about our cloud infrastructure")
 ```
 
 **Actions:**
 - `store` — Save content to memory with timestamp
-- `search` — Find memories by keyword (returns last 10 matches)
+- `search` — Semantic search over memories (returns last 10 matches)
 - `list` — Show recent memories (last 20)
+- `find_entity` — Search entities in the knowledge graph (type: person/org/concept)
+- `find_relationship` — Find connections between entities
+- `get_summary` — Get pre-computed summary by key (e.g., 'root', 'entity:uuid')
+- `get_context` — Get assembled context for the current conversation
+- `deep_search` — Thorough agentic search for complex queries
+- `list_tools` — List all registered tools with usage stats and health status
+- `tool_stats` — Get aggregate statistics about tool usage
+- `problematic_tools` — Find tools with high error rates
+- `get_tool` — Get detailed info about a specific tool (tool_name)
+
+**Convenience Methods (for dynamic tools):**
+
+Dynamic tools can access memory directly via agent methods:
+
+```python
+# In a dynamic tool function
+def my_tool(params: dict, agent) -> dict:
+    # Search memory
+    result = agent.memory_recall("server IP")
+    # Returns: {"memories": [{"content": "...", "timestamp": "...", "channel": "..."}]}
+
+    # Store to memory
+    result = agent.memory_store("New fact discovered")
+    # Returns: {"stored": True, "event_id": "..."}
+
+    return {"success": True}
+```
 
 ### Notes Tool
 
@@ -435,24 +523,44 @@ agent.run("Remove note 1")
 
 ### Objectives Tool
 
-Background work that runs asynchronously while chat continues.
+Background work that runs asynchronously while chat continues. Features priority queuing, automatic retry with exponential backoff, budget controls, and true cancellation.
 
 ```python
 # Start a one-time objective
 agent.run("Research the latest Claude API features and summarize them")
 
-# Check objective status
+# Start with priority (1=highest, 10=lowest)
+agent.run("Urgent: Research competitor announcement immediately")  # priority=1
+
+# Start with budget limit
+agent.run("Research market trends, but limit to $0.50")  # budget_usd=0.50
+
+# Start with token limit
+agent.run("Generate a summary, max 10000 tokens")  # token_limit=10000
+
+# Check objective status (includes cost tracking)
 agent.run("What objectives are running?")
 
-# Cancel an objective
+# Cancel an objective (immediately signals running objective to stop)
 agent.run("Cancel objective abc123")
 ```
 
 **Actions:**
-- `spawn` — Start a new background objective (goal, optional schedule)
-- `list` — See all objectives and their status
-- `check` — Get details of specific objective (id)
-- `cancel` — Stop an objective (id)
+- `spawn` — Start a new background objective with options:
+  - `goal` — What to accomplish (required)
+  - `priority` — 1-10, lower = higher priority (default: 5)
+  - `schedule` — Recurring schedule (optional)
+  - `budget_usd` — Maximum cost allowed (stops if exceeded)
+  - `token_limit` — Maximum tokens allowed (stops if exceeded)
+  - `max_retries` — Retry attempts on failure (default: 3)
+- `list` — See all objectives sorted by priority, with status and cost tracking
+- `check` — Get full details including retry count, spent_usd, tokens_used
+- `cancel` — Stop an objective (sends cancellation signal to running objectives)
+
+**Concurrency & Retry:**
+- Max 5 objectives run simultaneously; others queue by priority
+- Failed objectives retry automatically with exponential backoff (2s, 4s, 8s)
+- Budget exceeded or max retries reached → objective fails permanently
 
 ### Schedule Tool
 
@@ -571,6 +679,119 @@ store = MemoryStore()
 unhealthy = store.get_unhealthy_tools()  # Tools with high error rates
 problematic = store.get_problematic_tools()  # Tools needing attention
 ```
+
+### Skills Tool
+
+Skills are behavioral instructions stored as SKILL.md files. Unlike executable tools that run code, skills provide guidance that the AI follows.
+
+```python
+# Acquire a skill from a URL or file
+agent.run("Learn the code review skill from https://example.com/skills/code-review/SKILL.md")
+
+# Acquire with auto-enable if safe
+agent.run("Acquire skill from ~/my-skills/email-triage.md and enable it if safe")
+
+# Check skill readiness
+agent.run("Check if the email-triage skill has all required tools")
+
+# Activate a skill to get instructions
+agent.run("Activate the code review skill")
+```
+
+**SKILL.md Format:**
+
+```markdown
+---
+name: code-review
+description: Guidelines for thorough code reviews
+---
+
+# Code Review Skill
+
+When reviewing code, follow these steps:
+1. Check for security vulnerabilities
+2. Verify error handling
+3. Look for performance issues
+4. Ensure tests are adequate
+```
+
+**Safety Scanning:**
+- Skills are scanned for dangerous patterns before activation
+- Score >= 80: Safe, can auto-enable
+- Score < 80: Requires manual review
+- Critical patterns (eval, exec, prompt injection): Auto-rejected
+
+### Composio Integration
+
+Composio provides 250+ OAuth app integrations (Slack, GitHub, Notion, Gmail, etc.). Once connected, Composio actions become tools in your toolkit.
+
+```python
+# List available apps
+agent.run("Show me what Composio apps are available")
+
+# Connect to an app (starts OAuth flow)
+agent.run("Connect to Slack via Composio")
+
+# Enable app tools
+agent.run("Enable all GitHub actions from Composio")
+
+# Enable specific actions only
+agent.run("Enable only SLACK_SEND_MESSAGE from Composio")
+
+# Check connection status
+agent.run("What Composio integrations do I have enabled?")
+
+# Use Composio tools (after enabling)
+agent.run("Send a message to #general on Slack saying 'Hello from BabyAGI!'")
+```
+
+**Setup:**
+
+```bash
+# Install Composio
+pip install composio-core
+
+# Login to Composio
+composio login
+
+# Set API key (alternative)
+export COMPOSIO_API_KEY="your-key"
+```
+
+**Composio Actions:**
+- `list_apps` — Show all available apps
+- `list_actions` — Show actions for a specific app
+- `connect` — Start OAuth flow to authorize an app
+- `enable` — Register Composio actions as tools
+- `disable` — Remove tools (keeps Composio auth)
+- `status` — Show what's connected and enabled
+
+### Workflow Tools
+
+Workflows combine multiple tools and skills into reusable automation.
+
+```python
+# Create a workflow
+agent.run("""
+Create a workflow called 'daily_standup' that:
+1. Activates the standup format skill
+2. Gathers yesterday's completed tasks
+3. Posts the summary to Slack #standup
+""")
+
+# Workflows can declare dependencies
+agent.run("""
+Create workflow 'pr_review' depending on:
+- skill_code_review
+- github_create_review
+""")
+```
+
+**Workflow Features:**
+- Dependencies are verified before creation
+- Generated as executable Python tools
+- Can combine skills with executable tools
+- Persisted for reuse across sessions
 
 ### Send Message Tool
 
@@ -735,6 +956,30 @@ channels:
 agent:
   model: "claude-sonnet-4-20250514"
   # model: "claude-opus-4-20250514"  # For more complex tasks
+
+  # Agent identity
+  name: "${AGENT_NAME:Assistant}"
+  description: "${AGENT_DESCRIPTION:a helpful AI assistant}"
+  objective: "Help my owner with tasks..."
+
+  # Behavior settings
+  behavior:
+    spending:
+      require_approval: true
+      auto_approve_limit: 0.0  # USD
+    external_policy:
+      respond_to_unknown: true
+      consult_owner_threshold: "medium"  # low, medium, high
+    accounts:
+      use_agent_email: true
+      check_existing_first: true
+
+# Memory configuration (optional)
+memory:
+  enabled: true  # Set to false to disable persistent memory
+  path: "~/.babyagi/memory"  # SQLite database location
+  background_extraction: true  # Extract entities/relationships in background
+  extraction_interval: 60  # Seconds between extraction runs
 ```
 
 ### Environment Variables
@@ -896,10 +1141,16 @@ The agent emits events for all key operations, making it easy to build UIs or lo
 **Available Events:**
 - `tool_start` — Tool execution starting: `{name, input}`
 - `tool_end` — Tool execution completed: `{name, result, duration_ms}`
-- `objective_start` — Background objective starting: `{id, goal}`
-- `objective_end` — Background objective completed: `{id, status, result}`
+- `tool_registered` — New tool registered: `{name, description, parameters, source_code}`
+- `tool_disabled` — Tool disabled: `{name, reason}`
+- `objective_start` — Background objective starting: `{id, goal, priority, attempt}`
+- `objective_end` — Background objective completed: `{id, status, result, spent_usd, tokens_used}`
+- `objective_retry` — Objective retrying after failure: `{id, attempt, max_retries, delay_seconds, error}`
+- `objective_usage` — Token/cost update for objective: `{id, input_tokens, output_tokens, cost_usd, total_spent_usd, total_tokens_used}`
 - `task_start` — Scheduled task starting: `{id, name, goal}`
 - `task_end` — Scheduled task completed: `{id, status, duration_ms}`
+- `thread_repaired` — Corrupted thread auto-repaired: `{thread_id, repaired}`
+- `agent_response` — Agent finished generating response
 
 **Example: WebSocket UI**
 
@@ -1077,24 +1328,26 @@ summary = get_health_summary()
 |-----------|----------------|
 | **Single loop** | One control flow for everything |
 | **Tools are data** | Same structure handles memory, tasks, objectives, scheduling |
+| **Three tool types** | Executable (code), Skills (behavior), Composio (integrations) |
 | **LLM does the hard work** | Routing, synthesis, organization |
 | **No frameworks** | Just Python and the API |
-| **Extensible by design** | New capabilities = new tools |
-| **Safe extensibility** | Dynamic tools run in sandboxed environment |
+| **Extensible by design** | New capabilities = new tools, skills, or Composio apps |
+| **Safe extensibility** | Dynamic tools sandboxed, skills safety-scanned |
 | **Graceful degradation** | Missing packages/APIs degrade functionality but don't crash |
-| **Persistence** | Scheduled tasks and dynamic tools survive restarts |
+| **Persistence** | Tools, skills, and scheduled tasks survive restarts |
 | **Secure by default** | Credentials split between DB metadata and keyring secrets |
 
 ### The Entire System
 
-~300 lines of core code. Everything else is tools and channels.
+~300 lines of core code. Everything else is tools, memory, and channels.
 
 ```
 agent.py
 ├── Tool class (tool definition with health checks)
 ├── Agent class (main loop + channel support + EventEmitter)
-├── Objective class (background work)
+├── Objective class (background work with priority/budget)
 ├── Core tools (memory, objectives, notes, schedule, register, send_message)
+├── Skill/Composio loading (three tool types on startup)
 └── Sender registration
 
 scheduler.py
@@ -1103,14 +1356,35 @@ scheduler.py
 ├── SchedulerStore class (JSON persistence)
 └── Scheduler class (execution engine)
 
+memory/
+├── __init__.py (Memory facade)
+├── store.py (SQLite backend with vector search)
+├── models.py (Event, Entity, Edge, Topic, etc.)
+├── extraction.py (NLP entity/relationship extraction)
+├── summaries.py (Hierarchical summary management)
+├── context.py (Context assembly for prompts)
+├── retrieval.py (Quick and deep retrieval)
+├── embeddings.py (OpenAI embeddings with caching)
+├── integration.py (Agent hooks and enhanced memory tool)
+└── tool_context.py (Intelligent tool selection)
+
+metrics/
+├── __init__.py
+├── clients.py (Instrumented API client)
+├── costs.py (Token cost calculation)
+├── collector.py (Metrics aggregation)
+└── models.py (Metric data models)
+
 utils/
 ├── __init__.py
-├── events.py (EventEmitter mixin for decoupled event handling)
-└── console.py (styled terminal output with verbose levels)
+├── events.py (EventEmitter mixin)
+├── console.py (styled terminal output)
+├── collections.py (ThreadSafeList)
+└── email_client.py (Email utilities)
 
 listeners/
 ├── __init__.py
-├── cli.py (terminal input + event subscriptions for verbose output)
+├── cli.py (terminal input + verbose output)
 ├── email.py (inbox polling)
 └── voice.py (speech input)
 
@@ -1122,10 +1396,13 @@ senders/
 tools/
 ├── __init__.py (decorator framework + health checks)
 ├── sandbox.py (e2b code execution)
+├── skills.py (skills, Composio, workflows)
 ├── web.py (search, browse, fetch)
 ├── email.py (AgentMail tools)
 ├── secrets.py (API key storage)
-└── credentials.py (account & payment storage)
+├── credentials.py (account & payment storage)
+├── metrics.py (cost tracking tools)
+└── verbose.py (verbosity control)
 
 config.py (YAML loader with env substitution)
 config.yaml (channel configuration)
@@ -1158,7 +1435,25 @@ Create a detailed report.
 
 # The agent continues to respond while the objective runs
 agent.run("While that's running, can you help me with something else?")
+
+# Priority-based execution (urgent work runs first)
+agent.run("URGENT: Check if our API is down")  # Gets priority=1
+agent.run("When you have time, research market trends")  # Gets priority=7
+
+# Cost-controlled objectives
+agent.run("Research competitors but limit cost to $1.00")  # budget_usd=1.00
+agent.run("Analyze logs but use max 50000 tokens")  # token_limit=50000
+
+# Check status with cost tracking
+agent.run("Show me all objectives with their costs")
+# Returns: id, goal, status, priority, spent_usd, tokens_used, retry_count
 ```
+
+**Resource Controls:**
+- Max 5 objectives run concurrently; others queue by priority
+- Failed objectives auto-retry with exponential backoff (2s → 4s → 8s)
+- Budget/token limits prevent runaway costs
+- Cancel immediately stops running objectives
 
 ### Scheduled Tasks
 
@@ -1212,13 +1507,42 @@ Wait for the verification email and complete the signup.
 
 ## On "Organized Memory"
 
-The elegance is in not over-engineering this. The approach:
+The memory system uses a three-layer architecture:
 
-1. **Append-only log** — every memory is immutable, timestamped
-2. **Semantic search** — keyword match (swap for embeddings in production)
-3. **Summarization on read** — the LLM itself summarizes relevant memories at query time
+1. **Raw Event Log** — Every interaction stored immutably in SQLite with timestamps
+2. **Extracted Knowledge Graph** — Entities (people, orgs, concepts), relationships, and topics extracted via LLM
+3. **Hierarchical Summaries** — Pre-computed summaries at multiple levels for fast context assembly
 
-You don't need a complex knowledge graph. **The LLM is the organizer.** Give it raw memories and let it synthesize.
+**Key Features:**
+
+- **Semantic Search** — Vector embeddings (OpenAI text-embedding-3-small) enable meaning-based retrieval
+- **Entity Extraction** — Background process identifies people, organizations, concepts from events
+- **Relationship Discovery** — Connections between entities tracked (e.g., "John works_at Acme")
+- **Topic Tracking** — Conversations categorized by topic for better organization
+- **Context Assembly** — Smart context building pulls relevant history, summaries, and entities
+
+**The LLM is still the organizer.** The knowledge graph provides structure, but the LLM synthesizes meaning.
+
+**Storage Location:** `~/.babyagi/memory/memory.db` (configurable via `memory.path` in config.yaml)
+
+**Thread Repair:**
+
+If tool execution fails mid-conversation, the message history can become corrupted (orphaned `tool_use` without matching `tool_result`). The agent automatically repairs this:
+
+```python
+# Automatic repair on every run_async call
+# Manual repair if needed
+result = agent.repair_thread("main")
+# Returns: {"repaired": 1, "message": "Repaired 1 orphaned tool_use block(s)"}
+```
+
+**Graceful Degradation:**
+
+Memory features degrade gracefully:
+- If SQLite is unavailable, falls back to in-memory storage (session only)
+- If entity extraction fails, events are still logged
+- If summarization fails, raw events are still searchable
+- If embeddings API unavailable, keyword search still works
 
 ## API Reference
 
@@ -1232,8 +1556,18 @@ class Agent(EventEmitter):
         load_tools: bool = True,
         config: dict = None  # Channel/owner configuration
     )
-    def register(self, tool: Tool | ToolLike) -> None
+
+    # Properties
+    memory: Memory | None  # SQLite memory system (None if disabled)
+    scheduler: Scheduler   # Task scheduler
+    tools: dict[str, Tool] # Registered tools
+    senders: dict[str, Sender]  # Channel senders
+
+    # Tool registration
+    def register(self, tool: Tool | ToolLike, emit_event: bool = False) -> None
     def register_sender(self, channel: str, sender: Sender) -> None
+
+    # Message processing
     def run(self, user_input: str, thread_id: str = "main") -> str
     async def run_async(
         self,
@@ -1242,8 +1576,16 @@ class Agent(EventEmitter):
         context: dict = None  # Channel context (is_owner, sender, channel)
     ) -> str
     async def run_scheduler(self) -> None  # Start the scheduler loop
+    async def run_objective(self, objective_id: str) -> None  # Run objective
+
+    # Thread management
     def get_thread(self, thread_id: str = "main") -> list
     def clear_thread(self, thread_id: str = "main") -> None
+    def repair_thread(self, thread_id: str = "main") -> dict  # Fix corrupted threads
+
+    # Memory convenience methods (for dynamic tools)
+    def memory_recall(self, query: str) -> dict  # Search memory
+    def memory_store(self, content: str) -> dict  # Store to memory
 
     # Event methods (inherited from EventEmitter)
     def on(self, event: str, handler: Callable) -> Callable  # Subscribe
@@ -1274,13 +1616,23 @@ class Tool:
 class Objective:
     id: str
     goal: str
-    status: str  # "pending", "running", "completed", "failed"
+    status: str  # "pending", "running", "completed", "failed", "cancelled"
     thread_id: str
     schedule: str | None
     result: str | None
     error: str | None
     created: str
     completed: str | None
+    # Priority and retry controls
+    priority: int = 5  # 1-10, lower = higher priority
+    retry_count: int = 0
+    max_retries: int = 3
+    last_error: str | None = None
+    # Budget tracking
+    budget_usd: float | None = None  # Max cost allowed
+    spent_usd: float = 0.0
+    token_limit: int | None = None  # Max tokens allowed
+    tokens_used: int = 0
 ```
 
 ### Schedule
@@ -1414,6 +1766,7 @@ keyrings-cryptfile >= 1.3.9
 ddgs >= 9.10.0
 croniter >= 2.0.0
 pyyaml >= 6.0
+composio-core >= 0.7.21
 ```
 
 ### Optional (for voice channel)
