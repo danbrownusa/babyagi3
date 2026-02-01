@@ -1331,12 +1331,23 @@ SCHEDULE EXAMPLES:
 
         # Build channel-specific formatting rules
         formatting_rules = ""
-        if channel in ("sendblue", "email"):
+        if channel == "sendblue":
             formatting_rules = """
 
-MESSAGE FORMATTING:
+iMESSAGE FORMATTING (CRITICAL):
+- Be EXTREMELY CONCISE - this is a text message, not an email
+- Keep responses to 1-3 short sentences maximum
+- NO markdown formatting whatsoever (no **, *, #, `, ```, -, [], () link syntax)
+- Write in plain, casual text like a normal text message
+- If you need to explain something complex, offer to send details via email instead
+- Never send walls of text - break into multiple messages if truly necessary
+- Think "text message brevity" not "assistant explanation""""
+        elif channel == "email":
+            formatting_rules = """
+
+EMAIL FORMATTING:
 - Do NOT use markdown formatting (no **, *, #, `, ```, -, [], () link syntax, etc.)
-- Write in plain text only - these channels do not render markdown
+- Write in plain text only - email clients may not render markdown
 - Use natural language emphasis instead of formatting (e.g., say "important" rather than **important**)
 - For lists, use simple numbering (1. 2. 3.) or write items in prose"""
 
