@@ -13,6 +13,7 @@ Channels:
     - CLI: Command-line interface (always enabled)
     - Email: Receive and respond to emails via AgentMail
     - Voice: Speech input/output (requires additional packages)
+    - SendBlue: SMS/iMessage via SendBlue API
 
 Configuration:
     Set options in config.yaml or via environment variables.
@@ -184,8 +185,20 @@ async def run_all_channels():
         tasks.append(run_voice_listener(agent, voice_config))
         logger.info("Voice listener enabled")
 
+    # SendBlue (SMS/iMessage)
+    if is_channel_enabled(config, "sendblue"):
+        # Check if SendBlue is configured
+        if os.environ.get("SENDBLUE_API_KEY") and os.environ.get("SENDBLUE_API_SECRET"):
+            from listeners.sendblue import run_sendblue_listener
+            sendblue_config = get_channel_config(config, "sendblue")
+            sendblue_config["owner_phone"] = config.get("owner", {}).get("phone")
+            tasks.append(run_sendblue_listener(agent, sendblue_config))
+            logger.info("SendBlue listener enabled")
+        else:
+            logger.warning("SendBlue enabled but SENDBLUE_API_KEY or SENDBLUE_API_SECRET not set")
+
     # Log active channels
-    active_channels = [name for name in ["cli", "email", "voice"]
+    active_channels = [name for name in ["cli", "email", "voice", "sendblue"]
                       if is_channel_enabled(config, name)]
     console.system(f"\nActive channels: {', '.join(active_channels)}")
     console.system("Press Ctrl+C to stop\n")
@@ -217,10 +230,13 @@ def _register_senders(agent, config):
             agent.register_sender("email", EmailSender(email_config))
             logger.info("Email sender registered")
 
-    # Add more senders here as they're implemented
-    # if is_channel_enabled(config, "sms"):
-    #     from senders.sms import SMSSender
-    #     agent.register_sender("sms", SMSSender(get_channel_config(config, "sms")))
+    # SendBlue sender (SMS/iMessage)
+    if is_channel_enabled(config, "sendblue"):
+        if os.environ.get("SENDBLUE_API_KEY") and os.environ.get("SENDBLUE_API_SECRET"):
+            from senders.sendblue import SendBlueSender
+            sendblue_config = get_channel_config(config, "sendblue")
+            agent.register_sender("sendblue", SendBlueSender(sendblue_config))
+            logger.info("SendBlue sender registered")
 
 
 if __name__ == "__main__":
