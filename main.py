@@ -58,7 +58,7 @@ def main():
             # API server mode
             import uvicorn
             from server import app
-            port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+            port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
             uvicorn.run(app, host="0.0.0.0", port=port)
 
         elif command == "channels":
@@ -67,7 +67,7 @@ def main():
 
         elif command == "all":
             # Combined mode: API server + all channel listeners
-            port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+            port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
             asyncio.run(run_all_with_server(port))
 
         elif command == "cli":
@@ -221,7 +221,7 @@ async def run_all_channels():
             agent.memory.store.close()
 
 
-async def run_all_with_server(port: int = 8000):
+async def run_all_with_server(port: int = 5000):
     """Run API server + all channel listeners together.
 
     This mode enables:
