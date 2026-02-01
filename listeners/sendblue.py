@@ -1,8 +1,20 @@
 """
-SendBlue Listener - Poll for incoming SMS/iMessage messages.
+SendBlue Listener - Poll for SMS/iMessage messages.
 
-Monitors the SendBlue API for incoming messages and routes them to the agent.
-Owner messages are auto-replied; external messages let the agent decide.
+IMPORTANT: This polling-based listener only sees OUTBOUND messages (messages YOU sent).
+For INBOUND messages (messages others send to you), use the webhook endpoint instead:
+
+    POST /webhooks/sendblue
+
+Configure your SendBlue dashboard to send webhooks to:
+    https://your-domain.com/webhooks/sendblue
+
+See server.py for the webhook implementation.
+
+This listener can still be useful for:
+- Monitoring outbound message status
+- Debugging API connectivity
+- Legacy compatibility
 
 Requires SENDBLUE_API_KEY and SENDBLUE_API_SECRET environment variables.
 """
@@ -62,6 +74,10 @@ async def run_sendblue_listener(agent, config: dict = None):
         return
 
     logger.info("SendBlue listener started")
+    logger.warning(
+        "NOTE: Polling only sees OUTBOUND messages. "
+        "For INBOUND messages, configure webhooks to POST /webhooks/sendblue"
+    )
 
     # Track processed message IDs to avoid reprocessing
     processed_ids = set()
@@ -99,6 +115,14 @@ async def run_sendblue_listener(agent, config: dict = None):
 
                 data = response.json()
                 messages = data.get("messages", [])
+
+                # Log poll results for visibility
+                inbound_count = sum(1 for m in messages if not m.get("is_outbound", False))
+                outbound_count = len(messages) - inbound_count
+                logger.debug(
+                    f"SendBlue poll: {len(messages)} messages "
+                    f"({inbound_count} inbound, {outbound_count} outbound)"
+                )
 
                 # Process messages (filter for inbound only)
                 for msg in messages:
