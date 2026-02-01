@@ -39,14 +39,33 @@ from utils.console import console
 
 # Configure logging with immediate stderr output
 handler = logging.StreamHandler(sys.stderr)
-handler.setLevel(logging.INFO)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logging.root.addHandler(handler)
 
 # Suppress noisy library loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.root.addHandler(handler)
-logging.root.setLevel(logging.INFO)
+logging.getLogger("primp").setLevel(logging.WARNING)
+
+# Default to WARNING - will be adjusted based on verbose level
+logging.root.setLevel(logging.WARNING)
+handler.setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+
+def configure_logging_for_verbose(verbose_level: str):
+    """Configure Python logging level based on verbose setting.
+    
+    - off/light: Only show WARNING and above (suppress INFO)
+    - deep: Show INFO and above (full logging)
+    """
+    if verbose_level == "deep" or verbose_level == "2":
+        logging.root.setLevel(logging.INFO)
+        handler.setLevel(logging.INFO)
+    else:
+        # off or light - suppress INFO level logs
+        logging.root.setLevel(logging.WARNING)
+        handler.setLevel(logging.WARNING)
 
 
 def main():
@@ -98,6 +117,7 @@ async def run_cli_only():
     if not os.environ.get("BABYAGI_VERBOSE"):
         verbose_config = config.get("verbose", "off")
         console.set_verbose(verbose_config)
+        configure_logging_for_verbose(verbose_config)
 
     # Initialize agent (memory status is printed during initialization)
     agent = Agent(config=config)
@@ -142,6 +162,7 @@ async def run_all_channels():
     if not os.environ.get("BABYAGI_VERBOSE"):
         verbose_config = config.get("verbose", "off")
         console.set_verbose(verbose_config)
+        configure_logging_for_verbose(verbose_config)
 
     # Initialize agent with config (memory status is printed during initialization)
     agent = Agent(config=config)
@@ -247,6 +268,7 @@ async def run_all_with_server(port: int = 5000):
     if not os.environ.get("BABYAGI_VERBOSE"):
         verbose_config = config.get("verbose", "off")
         console.set_verbose(verbose_config)
+        configure_logging_for_verbose(verbose_config)
 
     # Register all senders on the server's agent
     _register_senders(agent, config)

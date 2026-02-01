@@ -1,0 +1,16 @@
+2026-02-01 06:30:55,359 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: do you see this?
+2026-02-01 06:30:57,500 - listeners.email - INFO - Processing email from BabyAGI <babyagi@agentmail.to>: Re: respond to this!
+2026-02-01 06:31:01,656 - senders.sendblue - ERROR - SendBlue send failed: 202 - None
+2026-02-01 06:31:01,657 - server - INFO - Replied to +12133081799
+2026-02-01 06:31:15,058 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: respond to this!
+2026-02-01 06:32:09,324 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: did you get this?
+2026-02-01 06:32:22,786 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: respond if you see this
+2026-02-01 06:32:25,457 - primp - INFO - response: https://grokipedia.com/api/typeahead?query=AI+artificial+intelligence+news+today+February+2026+latest+developments&limit=1 200
+2026-02-01 06:32:25,530 - primp - INFO - response: https://en.wikipedia.org/w/api.php?action=opensearch&profile=fuzzy&limit=1&search=AI%20artificial%20intelligence%20news%20today%20February%202026%20latest%20developments 200
+2026-02-01 06:32:26,032 - primp - INFO - response: https://www.mojeek.com/search?q=AI+artificial+intelligence+news+today+February+2026+latest+developments 403
+2026-02-01 06:32:26,690 - primp - INFO - response: https://search.brave.com/search?q=AI+artificial+intelligence+news+today+February+2026+latest+developments&source=web 200
+2026-02-01 06:32:44,841 - listeners.email - INFO - Processing email from BabyAGI <babyagi@agentmail.to>: Introduction: Your AI Agent and Capabilities Overv
+2026-02-01 06:32:53,320 - listeners.email - INFO - Processing email from BabyAGI <babyagi@agentmail.to>: Email System Test - Functionality Verification
+2026-02-01 06:33:01,958 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: Do you get this?
+2026-02-01 06:35:03,550 - listeners.email - INFO - Processing email from BabyAGI <babyagi@agentmail.to>: Testing AI Assistant Functionality
+2026-02-01 06:35:11,217 - listeners.email - INFO - Processing email from Yohei Nakajima <yohei@untapped.vc>: hey
