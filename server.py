@@ -3,6 +3,7 @@ API Server for the Agent
 
 Provides HTTP endpoints for:
 - Receiving messages (webhooks)
+- SendBlue SMS/iMessage webhooks
 - Checking objective status
 - Managing threads
 
@@ -10,12 +11,17 @@ This enables external systems to interact with the agent via HTTP.
 """
 
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request, Header, HTTPException
 from pydantic import BaseModel
 
 from agent import Agent, Objective
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -26,11 +32,30 @@ agent = Agent()
 scheduler_task: asyncio.Task | None = None
 
 
+def _register_server_senders():
+    """Register senders for webhook replies."""
+    # SendBlue sender (for auto-reply to webhook messages)
+    if os.environ.get("SENDBLUE_API_KEY") and os.environ.get("SENDBLUE_API_SECRET"):
+        try:
+            from senders.sendblue import SendBlueSender
+            sendblue_config = {
+                "api_key": os.environ.get("SENDBLUE_API_KEY"),
+                "api_secret": os.environ.get("SENDBLUE_API_SECRET"),
+                "from_number": os.environ.get("SENDBLUE_PHONE_NUMBER"),
+            }
+            agent.register_sender("sendblue", SendBlueSender(sendblue_config))
+            logger.info("SendBlue sender registered for webhooks")
+        except Exception as e:
+            logger.error(f"Failed to register SendBlue sender: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start scheduler on startup, clean up on shutdown."""
+    """Start scheduler on startup, register senders, clean up on shutdown."""
     global scheduler_task
+    _register_server_senders()
     scheduler_task = asyncio.create_task(agent.run_scheduler())
+    logger.info("Server started with SendBlue webhook at /webhooks/sendblue")
     yield
     if scheduler_task:
         scheduler_task.cancel()
@@ -69,6 +94,28 @@ class ObjectiveResponse(BaseModel):
     schedule: str | None
     result: str | None
     error: str | None
+
+
+class SendBlueWebhookPayload(BaseModel):
+    """SendBlue webhook payload for inbound messages.
+
+    See: https://docs.sendblue.com/getting-started/webhooks/
+    """
+    message_handle: Optional[str] = None
+    from_number: Optional[str] = None
+    to_number: Optional[str] = None
+    content: Optional[str] = None
+    media_url: Optional[str] = None
+    date_sent: Optional[str] = None
+    date_created: Optional[str] = None
+    is_outbound: Optional[bool] = False
+    was_downgraded: Optional[bool] = None
+    status: Optional[str] = None
+    error_code: Optional[int] = None
+    error_message: Optional[str] = None
+    # Additional fields that may be present
+    account_email: Optional[str] = None
+    group_id: Optional[str] = None
 
 
 # =============================================================================
@@ -151,6 +198,133 @@ async def health():
         "threads_count": len(agent.threads),
         "tools": list(agent.tools.keys())
     }
+
+
+# =============================================================================
+# SendBlue Webhook
+# =============================================================================
+
+# Track processed message IDs to prevent duplicates
+_sendblue_processed_ids: set[str] = set()
+
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize phone number for comparison."""
+    if not phone:
+        return ""
+    cleaned = phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "")
+    if not cleaned.startswith("+"):
+        if cleaned.startswith("1") and len(cleaned) == 11:
+            cleaned = "+" + cleaned
+        elif len(cleaned) == 10:
+            cleaned = "+1" + cleaned
+    return cleaned.lower()
+
+
+@app.post("/webhooks/sendblue")
+async def sendblue_webhook(
+    payload: SendBlueWebhookPayload,
+    background_tasks: BackgroundTasks,
+    request: Request,
+):
+    """
+    Receive inbound SMS/iMessage from SendBlue.
+
+    Configure this URL in your SendBlue dashboard:
+    https://your-domain.com/webhooks/sendblue
+
+    SendBlue will POST to this endpoint when messages are received.
+    """
+    global _sendblue_processed_ids
+
+    # Log the incoming webhook
+    logger.info(f"SendBlue webhook received: from={payload.from_number}, content_preview={payload.content[:50] if payload.content else 'empty'}...")
+
+    # Get message ID for deduplication
+    msg_id = payload.message_handle or f"{payload.from_number}:{payload.date_sent}"
+
+    # Skip if already processed (webhooks can be sent multiple times)
+    if msg_id in _sendblue_processed_ids:
+        logger.debug(f"SendBlue webhook: skipping duplicate message {msg_id}")
+        return {"status": "ok", "message": "duplicate"}
+
+    # Skip outbound messages (this webhook is for inbound)
+    if payload.is_outbound:
+        logger.debug(f"SendBlue webhook: skipping outbound message {msg_id}")
+        return {"status": "ok", "message": "outbound_ignored"}
+
+    # Skip empty messages
+    if not payload.content and not payload.media_url:
+        logger.debug(f"SendBlue webhook: skipping empty message {msg_id}")
+        return {"status": "ok", "message": "empty_ignored"}
+
+    # Mark as processed
+    _sendblue_processed_ids.add(msg_id)
+
+    # Limit processed IDs cache size (keep last 1000)
+    if len(_sendblue_processed_ids) > 1000:
+        _sendblue_processed_ids = set(list(_sendblue_processed_ids)[-500:])
+
+    # Get owner phone for comparison
+    owner_phone = os.environ.get("OWNER_PHONE", "")
+    owner_phone_normalized = _normalize_phone(owner_phone)
+    from_number_normalized = _normalize_phone(payload.from_number or "")
+
+    # Determine if owner
+    is_owner = bool(
+        owner_phone_normalized and
+        from_number_normalized == owner_phone_normalized
+    )
+
+    # Build thread ID
+    if is_owner:
+        thread_id = "sendblue:owner"
+    else:
+        thread_id = f"sendblue:{from_number_normalized}"
+
+    # Build context
+    context = {
+        "channel": "sendblue",
+        "is_owner": is_owner,
+        "sender": payload.from_number,
+        "message_id": msg_id,
+    }
+
+    # Format input with message context
+    sender_type = "Owner" if is_owner else "External"
+    message_input = f"[Text from {sender_type}: {payload.from_number}]\n\n{payload.content or ''}"
+
+    if payload.media_url:
+        message_input += f"\n\n[Media attached: {payload.media_url}]"
+
+    logger.info(f"Processing SendBlue message from {payload.from_number} (owner={is_owner})")
+
+    # Process in background to return 200 quickly (SendBlue requires fast response)
+    async def process_and_reply():
+        try:
+            response_text = await agent.run_async(
+                message_input,
+                thread_id=thread_id,
+                context=context
+            )
+
+            # Auto-reply for owner messages
+            if is_owner and response_text:
+                if "sendblue" in agent.senders:
+                    await agent.senders["sendblue"].send(
+                        to=payload.from_number,
+                        content=response_text
+                    )
+                    logger.info(f"Replied to {payload.from_number}")
+                else:
+                    logger.warning("SendBlue sender not registered, cannot auto-reply")
+
+        except Exception as e:
+            logger.error(f"Error processing SendBlue message: {e}")
+
+    background_tasks.add_task(process_and_reply)
+
+    return {"status": "ok", "message": "processing"}
 
 
 # =============================================================================
