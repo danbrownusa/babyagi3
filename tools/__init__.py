@@ -297,7 +297,9 @@ def get_all_tools(tool_class):
         tool_class: The Tool class from agent.py
     """
     # Import all tool modules to trigger registration
-    from tools import web, email, secrets, verbose, credentials, metrics, research
+    # Note: research_agent provides delegation tools (research_task, research_status)
+    # The detailed research tools are only used by the research agent itself
+    from tools import web, email, secrets, verbose, credentials, metrics, research_agent
 
     tools = []
     for info in _registered_tools:
@@ -322,7 +324,7 @@ def get_registered_tool_info() -> list[dict]:
     """
     # Ensure tools are imported
     try:
-        from tools import web, email, secrets, verbose, credentials, metrics, research
+        from tools import web, email, secrets, verbose, credentials, metrics, research_agent
     except ImportError:
         pass
 
@@ -333,6 +335,42 @@ def init_tools(tool_class):
     """Initialize the tools framework with the Tool class."""
     global _Tool
     _Tool = tool_class
+
+
+def get_research_tools(tool_class):
+    """
+    Get the detailed research tools for the research agent.
+
+    These are internal tools used by research objectives, not exposed
+    to the main agent (which just uses research_task for delegation).
+
+    Returns list of Tool instances for:
+    - data_collection, batch_next, checkpoint, etc.
+    """
+    # Import research module (not research_agent) to get detailed tools
+    from tools import research
+
+    # Get tools registered by research module
+    research_tool_names = {
+        "data_collection", "checkpoint", "rate_limit", "export_collection",
+        "update_collection_item", "batch_next", "research_progress",
+        "pace_work", "reset_collection_items", "import_collection", "cursor_state"
+    }
+
+    tools = []
+    for info in _registered_tools:
+        if info["name"] in research_tool_names:
+            t = tool_class(
+                name=info["name"],
+                description=info["description"],
+                parameters=info["parameters"],
+                fn=info["fn"],
+                packages=info.get("packages", []),
+                env=info.get("env", []),
+            )
+            tools.append(t)
+
+    return tools
 
 
 # =============================================================================
@@ -392,8 +430,8 @@ def check_tool_health(include_core: bool = True) -> dict:
     # Add core tools (always available, no external deps)
     if include_core:
         core_tools = ["memory", "objective", "notes", "register_tool", "store_credential", "get_credential", "list_credentials"]
-        # Research tools are also always available (no external deps)
-        research_tools = ["data_collection", "checkpoint", "rate_limit", "export_collection", "update_collection_item", "batch_next", "research_progress", "pace_work", "reset_collection_items", "import_collection", "cursor_state"]
+        # Research delegation tools (detailed tools are internal to research agent)
+        research_tools = ["research_task", "research_status"]
         health["ready"] = core_tools + research_tools + health["ready"]
 
         # Check E2B for sandbox capability
