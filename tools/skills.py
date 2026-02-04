@@ -611,7 +611,7 @@ def _composio_setup_tool(agent: "Agent", Tool: type) -> "Tool":
                     try:
                         # Try to create a connected account with provided credentials
                         connection = client.connected_accounts.initiate(
-                            app_name=app,
+                            app=app,
                             entity_id=entity_id,
                             auth_config={
                                 "credentials": credentials
@@ -643,7 +643,7 @@ def _composio_setup_tool(agent: "Agent", Tool: type) -> "Tool":
 
                 # Standard OAuth flow - initiate connection
                 connection = client.connected_accounts.initiate(
-                    app_name=app,
+                    app=app,
                     entity_id=entity_id,
                 )
 
