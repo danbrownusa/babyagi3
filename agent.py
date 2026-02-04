@@ -1341,7 +1341,8 @@ iMESSAGE FORMATTING (CRITICAL):
 - Write in plain, casual text like a normal text message
 - If you need to explain something complex, offer to send details via email instead
 - Never send walls of text - break into multiple messages if truly necessary
-- Think "text message brevity" not "assistant explanation""""
+- Think "text message brevity" not "assistant explanation"
+"""
         elif channel == "email":
             formatting_rules = """
 
