@@ -13,15 +13,22 @@ Use cases:
 - agent_model: General agent operations
 - memory_model: Memory operations (extraction, summaries, learning)
 - fast_model: Quick, cheap operations (classification, routing)
+
+Provider Detection:
+- If ANTHROPIC_API_KEY is set: Uses Claude models by default
+- If OPENAI_API_KEY is set: Uses GPT models by default
+- If both are set: Prefers Anthropic (can be overridden in config)
+- If neither is set: Raises helpful error at startup
 """
 
 import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-# Check which API keys are available
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+def _get_api_key(name: str) -> str | None:
+    """Get API key from environment, refreshing each time."""
+    return os.environ.get(name)
 
 
 @dataclass
@@ -45,46 +52,183 @@ class ModelConfig:
         return self.model_id
 
 
+# ═══════════════════════════════════════════════════════════
+# PROVIDER DETECTION AND VALIDATION
+# ═══════════════════════════════════════════════════════════
+
+
+class NoLLMProviderError(Exception):
+    """Raised when no LLM provider API key is configured."""
+    pass
+
+
+def get_available_provider() -> str:
+    """
+    Detect which LLM provider is available based on API keys.
+
+    Returns:
+        'anthropic' if ANTHROPIC_API_KEY is set
+        'openai' if OPENAI_API_KEY is set
+        'none' if neither is set
+    """
+    if _get_api_key("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    elif _get_api_key("OPENAI_API_KEY"):
+        return "openai"
+    return "none"
+
+
+def is_llm_configured() -> bool:
+    """
+    Check if at least one LLM provider is configured.
+
+    Returns:
+        True if either OPENAI_API_KEY or ANTHROPIC_API_KEY is set
+    """
+    return bool(_get_api_key("OPENAI_API_KEY") or _get_api_key("ANTHROPIC_API_KEY"))
+
+
+def get_missing_config_message() -> str:
+    """
+    Get a helpful message explaining how to configure an LLM provider.
+
+    Returns:
+        Multi-line string with setup instructions
+    """
+    return """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         LLM CONFIGURATION REQUIRED                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  BabyAGI requires an LLM provider to function. Please set one of these       ║
+║  environment variables:                                                      ║
+║                                                                              ║
+║  Option 1: Anthropic (Claude) - Recommended                                  ║
+║  ─────────────────────────────────────────────                               ║
+║    export ANTHROPIC_API_KEY="sk-ant-..."                                     ║
+║                                                                              ║
+║    Get your API key at: https://console.anthropic.com/                       ║
+║    Models used: claude-sonnet-4, claude-3-5-haiku                            ║
+║                                                                              ║
+║  Option 2: OpenAI (GPT)                                                      ║
+║  ──────────────────────                                                      ║
+║    export OPENAI_API_KEY="sk-..."                                            ║
+║                                                                              ║
+║    Get your API key at: https://platform.openai.com/api-keys                 ║
+║    Models used: gpt-4o, gpt-4o-mini                                          ║
+║                                                                              ║
+║  You can also set these in a .env file in the project root.                  ║
+║                                                                              ║
+║  For model customization, edit config.yaml:                                  ║
+║    llm:                                                                      ║
+║      agent_model:                                                            ║
+║        model: "gpt-4o"  # or "claude-sonnet-4-20250514"                      ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+
+def check_llm_configuration() -> None:
+    """
+    Check if LLM is configured and raise helpful error if not.
+
+    Raises:
+        NoLLMProviderError: If no LLM provider is configured
+    """
+    if not is_llm_configured():
+        raise NoLLMProviderError(get_missing_config_message())
+
+
+# ═══════════════════════════════════════════════════════════
+# DEFAULT MODEL CONFIGURATIONS BY PROVIDER
+# ═══════════════════════════════════════════════════════════
+
+
+# Default models for Anthropic (when ANTHROPIC_API_KEY is set)
+ANTHROPIC_DEFAULTS = {
+    "coding": "claude-sonnet-4-20250514",      # Best for code generation
+    "research": "claude-sonnet-4-20250514",    # Good for research/analysis
+    "agent": "claude-sonnet-4-20250514",       # Main agent operations
+    "memory": "claude-sonnet-4-20250514",      # Memory extraction/summaries
+    "fast": "claude-3-5-haiku-20241022",       # Quick/cheap operations
+    "embedding": "text-embedding-3-small",     # OpenAI embeddings (or local fallback)
+}
+
+# Default models for OpenAI (when OPENAI_API_KEY is set)
+OPENAI_DEFAULTS = {
+    "coding": "gpt-4o",           # Best for code generation
+    "research": "gpt-4o",         # Good for research/analysis
+    "agent": "gpt-4o",            # Main agent operations
+    "memory": "gpt-4o-mini",      # Memory extraction/summaries (cheaper)
+    "fast": "gpt-4o-mini",        # Quick/cheap operations
+    "embedding": "text-embedding-3-small",  # OpenAI embeddings
+}
+
+
+def get_default_models_for_provider(provider: str) -> dict[str, str]:
+    """
+    Get default model IDs for each use case based on provider.
+
+    Args:
+        provider: 'anthropic' or 'openai'
+
+    Returns:
+        Dictionary mapping use case to model ID
+    """
+    if provider == "anthropic":
+        return ANTHROPIC_DEFAULTS.copy()
+    elif provider == "openai":
+        return OPENAI_DEFAULTS.copy()
+    else:
+        # No provider - return Anthropic defaults but they won't work
+        return ANTHROPIC_DEFAULTS.copy()
+
+
+# ═══════════════════════════════════════════════════════════
+# LLM CONFIGURATION CLASS
+# ═══════════════════════════════════════════════════════════
+
+
 @dataclass
 class LLMConfig:
     """
     Configuration for all LLM models used in the system.
 
     Different use cases can use different models:
-    - coding: Powerful model for code generation (e.g., Claude Opus, GPT-4)
-    - research: Model for research tasks (e.g., Claude Sonnet, GPT-4)
-    - agent: Main agent operations (e.g., Claude Sonnet, GPT-4)
-    - memory: Memory operations like extraction, summaries (e.g., Claude Sonnet)
-    - fast: Quick operations like classification (e.g., Claude Haiku, GPT-3.5)
+    - coding: Powerful model for code generation (e.g., Claude Opus, GPT-4o)
+    - research: Model for research tasks (e.g., Claude Sonnet, GPT-4o)
+    - agent: Main agent operations (e.g., Claude Sonnet, GPT-4o)
+    - memory: Memory operations like extraction, summaries (e.g., Claude Sonnet, GPT-4o-mini)
+    - fast: Quick operations like classification (e.g., Claude Haiku, GPT-4o-mini)
     """
 
     # Model configurations for different use cases
     coding_model: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_id="claude-sonnet-4-20250514",
+        model_id=ANTHROPIC_DEFAULTS["coding"],
         max_tokens=8096,
         temperature=0.0,
     ))
 
     research_model: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_id="claude-sonnet-4-20250514",
+        model_id=ANTHROPIC_DEFAULTS["research"],
         max_tokens=4096,
         temperature=0.0,
     ))
 
     agent_model: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_id="claude-sonnet-4-20250514",
+        model_id=ANTHROPIC_DEFAULTS["agent"],
         max_tokens=8096,
         temperature=0.0,
     ))
 
     memory_model: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_id="claude-sonnet-4-20250514",
+        model_id=ANTHROPIC_DEFAULTS["memory"],
         max_tokens=2048,
         temperature=0.0,
     ))
 
     fast_model: ModelConfig = field(default_factory=lambda: ModelConfig(
-        model_id="claude-3-5-haiku-20241022",
+        model_id=ANTHROPIC_DEFAULTS["fast"],
         max_tokens=1024,
         temperature=0.0,
     ))
@@ -98,9 +242,21 @@ class LLMConfig:
         """Create LLMConfig from a configuration dictionary."""
         llm_config = config.get("llm", {})
 
-        instance = cls()
+        # Start with provider-appropriate defaults
+        provider = get_available_provider()
+        defaults = get_default_models_for_provider(provider)
 
-        # Parse model configurations
+        instance = cls(
+            coding_model=ModelConfig(model_id=defaults["coding"], max_tokens=8096),
+            research_model=ModelConfig(model_id=defaults["research"], max_tokens=4096),
+            agent_model=ModelConfig(model_id=defaults["agent"], max_tokens=8096),
+            memory_model=ModelConfig(model_id=defaults["memory"], max_tokens=2048),
+            fast_model=ModelConfig(model_id=defaults["fast"], max_tokens=1024),
+            embedding_model=defaults.get("embedding", "text-embedding-3-small"),
+            embedding_provider=provider if provider != "none" else "local",
+        )
+
+        # Override with config values if provided
         if "coding_model" in llm_config:
             instance.coding_model = cls._parse_model_config(llm_config["coding_model"])
         if "research_model" in llm_config:
@@ -126,64 +282,11 @@ class LLMConfig:
         if isinstance(config, str):
             return ModelConfig(model_id=config)
         return ModelConfig(
-            model_id=config.get("model", config.get("model_id", "claude-sonnet-4-20250514")),
+            model_id=config.get("model", config.get("model_id", ANTHROPIC_DEFAULTS["agent"])),
             max_tokens=config.get("max_tokens", 4096),
             temperature=config.get("temperature", 0.0),
             provider=config.get("provider", "auto"),
         )
-
-
-def get_available_provider() -> str:
-    """
-    Detect which LLM provider is available based on API keys.
-
-    Returns:
-        'anthropic' if ANTHROPIC_API_KEY is set
-        'openai' if OPENAI_API_KEY is set
-        'none' if neither is set
-    """
-    if ANTHROPIC_API_KEY:
-        return "anthropic"
-    elif OPENAI_API_KEY:
-        return "openai"
-    return "none"
-
-
-def get_default_models_for_provider(provider: str) -> dict[str, str]:
-    """
-    Get default model IDs for each use case based on provider.
-
-    Args:
-        provider: 'anthropic' or 'openai'
-
-    Returns:
-        Dictionary mapping use case to model ID
-    """
-    if provider == "anthropic":
-        return {
-            "coding": "claude-sonnet-4-20250514",
-            "research": "claude-sonnet-4-20250514",
-            "agent": "claude-sonnet-4-20250514",
-            "memory": "claude-sonnet-4-20250514",
-            "fast": "claude-3-5-haiku-20241022",
-        }
-    elif provider == "openai":
-        return {
-            "coding": "gpt-4o",
-            "research": "gpt-4o",
-            "agent": "gpt-4o",
-            "memory": "gpt-4o-mini",
-            "fast": "gpt-4o-mini",
-        }
-    else:
-        # Default to Anthropic models (will fail without API key)
-        return {
-            "coding": "claude-sonnet-4-20250514",
-            "research": "claude-sonnet-4-20250514",
-            "agent": "claude-sonnet-4-20250514",
-            "memory": "claude-sonnet-4-20250514",
-            "fast": "claude-3-5-haiku-20241022",
-        }
 
 
 def create_default_config() -> LLMConfig:
