@@ -251,16 +251,29 @@ def tool(
         if required:
             schema["required"] = required
 
-        # Create wrapper that handles the agent parameter
-        def wrapper(params: dict, agent):
-            # Build kwargs, filtering to only params the function accepts
-            sig_params = set(sig.parameters.keys()) - {"agent"}
-            kwargs = {k: v for k, v in params.items() if k in sig_params}
+        # Create wrapper that handles the agent parameter and async functions
+        sig_params = set(sig.parameters.keys()) - {"agent"}
 
-            # Check if function expects agent parameter
-            if "agent" in sig.parameters:
-                return func(agent=agent, **kwargs)
-            return func(**kwargs)
+        if inspect.iscoroutinefunction(func):
+            # Async wrapper for async functions
+            async def wrapper(params: dict, agent):
+                # Build kwargs, filtering to only params the function accepts
+                kwargs = {k: v for k, v in params.items() if k in sig_params}
+
+                # Check if function expects agent parameter
+                if "agent" in sig.parameters:
+                    return await func(agent=agent, **kwargs)
+                return await func(**kwargs)
+        else:
+            # Sync wrapper for sync functions
+            def wrapper(params: dict, agent):
+                # Build kwargs, filtering to only params the function accepts
+                kwargs = {k: v for k, v in params.items() if k in sig_params}
+
+                # Check if function expects agent parameter
+                if "agent" in sig.parameters:
+                    return func(agent=agent, **kwargs)
+                return func(**kwargs)
 
         # Store tool info for later registration (including requirements)
         tool_info = {
