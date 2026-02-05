@@ -236,7 +236,8 @@ class RecallClient:
                 "transcript": {
                     "provider": {
                         transcription_provider: {
-                            "mode": "prioritize_low_latency"  # Get transcripts faster (2-10s vs 3-10min)
+                            "mode": "prioritize_low_latency",  # Get transcripts faster (2-10s vs 3-10min)
+                            "language_code": "en",  # Required for low-latency mode
                         }
                     }
                 },
