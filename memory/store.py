@@ -693,6 +693,22 @@ class MemoryStore:
         """
         )
 
+        # Composio auth configs - stores auth_config_id per toolkit
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS composio_auth_configs (
+                id TEXT PRIMARY KEY,
+                toolkit TEXT NOT NULL UNIQUE,
+                auth_config_id TEXT NOT NULL,
+                auth_type TEXT NOT NULL DEFAULT 'managed',
+                scopes TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """
+        )
+
         self.conn.commit()
 
     def _create_indices(self):
@@ -3619,6 +3635,145 @@ class MemoryStore:
             updated_at=parse_datetime(row["updated_at"]),
             last_used_at=parse_datetime(row["last_used_at"]),
         )
+
+    # ═══════════════════════════════════════════════════════════
+    # COMPOSIO AUTH CONFIGS
+    # ═══════════════════════════════════════════════════════════
+
+    def save_composio_auth_config(
+        self,
+        toolkit: str,
+        auth_config_id: str,
+        auth_type: str = "managed",
+        scopes: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Save or update a Composio auth config for a toolkit.
+
+        Args:
+            toolkit: Toolkit name (e.g., "SLACK", "GITHUB")
+            auth_config_id: The auth_config_id from Composio
+            auth_type: "managed" (Composio's OAuth) or "custom"
+            scopes: OAuth scopes if applicable
+            metadata: Additional metadata
+        """
+        row_id = generate_id()
+        now = now_iso()
+        cur = self.conn.cursor()
+
+        # Check if config for this toolkit exists
+        cur.execute(
+            "SELECT id FROM composio_auth_configs WHERE toolkit = ?",
+            (toolkit.upper(),),
+        )
+        existing = cur.fetchone()
+
+        if existing:
+            # Update existing
+            cur.execute(
+                """
+                UPDATE composio_auth_configs SET
+                    auth_config_id = ?,
+                    auth_type = ?,
+                    scopes = ?,
+                    metadata = ?,
+                    updated_at = ?
+                WHERE toolkit = ?
+            """,
+                (
+                    auth_config_id,
+                    auth_type,
+                    serialize_json(scopes),
+                    serialize_json(metadata),
+                    now,
+                    toolkit.upper(),
+                ),
+            )
+        else:
+            # Insert new
+            cur.execute(
+                """
+                INSERT INTO composio_auth_configs
+                (id, toolkit, auth_config_id, auth_type, scopes, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    row_id,
+                    toolkit.upper(),
+                    auth_config_id,
+                    auth_type,
+                    serialize_json(scopes),
+                    serialize_json(metadata),
+                    now,
+                    now,
+                ),
+            )
+
+        self.conn.commit()
+        return {
+            "toolkit": toolkit.upper(),
+            "auth_config_id": auth_config_id,
+            "auth_type": auth_type,
+        }
+
+    def get_composio_auth_config(self, toolkit: str) -> dict | None:
+        """Get the stored auth config for a toolkit.
+
+        Args:
+            toolkit: Toolkit name (e.g., "SLACK", "GITHUB")
+
+        Returns:
+            Dict with auth_config_id and metadata, or None if not found
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT * FROM composio_auth_configs WHERE toolkit = ?",
+            (toolkit.upper(),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        return {
+            "id": row["id"],
+            "toolkit": row["toolkit"],
+            "auth_config_id": row["auth_config_id"],
+            "auth_type": row["auth_type"],
+            "scopes": deserialize_json(row["scopes"]),
+            "metadata": deserialize_json(row["metadata"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_composio_auth_configs(self) -> list[dict]:
+        """List all stored Composio auth configs."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT * FROM composio_auth_configs ORDER BY toolkit ASC")
+        return [
+            {
+                "id": row["id"],
+                "toolkit": row["toolkit"],
+                "auth_config_id": row["auth_config_id"],
+                "auth_type": row["auth_type"],
+                "scopes": deserialize_json(row["scopes"]),
+                "metadata": deserialize_json(row["metadata"]),
+            }
+            for row in cur.fetchall()
+        ]
+
+    def delete_composio_auth_config(self, toolkit: str) -> bool:
+        """Delete a Composio auth config.
+
+        Returns True if deleted, False if not found.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM composio_auth_configs WHERE toolkit = ?",
+            (toolkit.upper(),),
+        )
+        deleted = cur.rowcount > 0
+        self.conn.commit()
+        return deleted
 
     # ═══════════════════════════════════════════════════════════
     # LEARNINGS (Self-Improvement System)
