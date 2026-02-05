@@ -14,6 +14,7 @@ Chat continues while objectives work. Objectives can spawn sub-objectives.
 
 import asyncio
 import heapq
+import inspect
 import json
 import threading
 import time
@@ -890,11 +891,16 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
                                 error_msg = f"Tool '{block.name}' not found"
                                 result = {"error": error_msg}
                             else:
-                                # Run tool in thread pool to prevent blocking the event loop
-                                # This allows scheduler and other async tasks to run during tool execution
-                                result = await asyncio.to_thread(
-                                    self.tools[block.name].execute, block.input, self
-                                )
+                                # Check if tool function is async
+                                tool_fn = self.tools[block.name].fn
+                                if inspect.iscoroutinefunction(tool_fn):
+                                    # Async tools: await directly (they're I/O bound, not CPU bound)
+                                    result = await tool_fn(block.input, self)
+                                else:
+                                    # Sync tools: run in thread pool to prevent blocking the event loop
+                                    result = await asyncio.to_thread(
+                                        self.tools[block.name].execute, block.input, self
+                                    )
                         except Exception as e:
                             # Tool execution failed - capture the error
                             error_msg = f"Tool execution failed: {str(e)}"
