@@ -22,6 +22,37 @@ That's it. You now have a persistent AI agent with memory, scheduling, backgroun
 
 Verbose mode is on by default — you'll see tool calls, webhook activity, and background operations as they happen. To turn it off, just tell the agent "turn off verbose" or type `/verbose off`.
 
+## Initialization
+
+On first run, BabyAGI walks you through an interactive setup wizard. It detects that no `~/.babyagi/initialized` marker exists and launches the onboarding flow before starting the agent.
+
+### What the wizard covers
+
+1. **System overview** — explains how BabyAGI works (channels, memory, scheduling)
+2. **Owner info** — collects your name, email, phone, and timezone so the agent can personalize responses and reach you
+3. **Email channel (AgentMail)** — walks you through entering your AgentMail API key and creates an inbox for the agent. Get a free key at [agentmail.to](https://agentmail.to).
+4. **SMS/iMessage channel (SendBlue)** — walks you through entering your SendBlue API key and secret so you can text your agent from your phone. Get credentials at [sendblue.co](https://sendblue.co).
+
+### What gets set up automatically
+
+Once the wizard finishes, two recurring tasks are scheduled:
+
+- **Daily Stats Report** — compiles tool usage, memory extraction counts, LLM costs by model/source, scheduled task statuses, and errors from the last 24 hours. Emails the report to you. First run is ~5 minutes after setup, then every 24 hours.
+- **Daily Self-Improvement** — the agent picks one concrete action each day to become more helpful: create a new skill, set up a useful scheduled task, or ask you a question to better understand your needs. It tracks past actions in memory to avoid repetition.
+
+### Re-running initialization
+
+Delete the marker file and restart:
+
+```bash
+rm ~/.babyagi/initialized
+python main.py
+```
+
+Or skip the wizard entirely and configure manually via `config.yaml` and environment variables (see [Configuration](#configuration) below).
+
+---
+
 ## What You Can Ask For
 
 Everything below is done through natural conversation. The agent decides which tools to use.

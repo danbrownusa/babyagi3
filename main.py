@@ -112,6 +112,13 @@ def main():
     # First, check if LLM provider is configured (deterministic check, no API calls)
     check_llm_provider()
 
+    # Check if first-time initialization is needed
+    from initialization import needs_initialization, run_initialization
+    if needs_initialization():
+        from config import load_config
+        config = load_config()
+        run_initialization(config)
+
     if len(sys.argv) > 1:
         command = sys.argv[1]
 
@@ -164,6 +171,10 @@ async def run_cli_only():
     # Initialize agent (memory status is printed during initialization)
     agent = Agent(config=config)
 
+    # Schedule post-initialization tasks if this is a fresh setup
+    from initialization import schedule_post_init_tasks
+    schedule_post_init_tasks(agent)
+
     # Start optional memory background tasks
     background_tasks = []
     if agent.memory is not None:
@@ -209,6 +220,10 @@ async def run_all_channels():
 
     # Initialize agent with config (memory status is printed during initialization)
     agent = Agent(config=config)
+
+    # Schedule post-initialization tasks if this is a fresh setup
+    from initialization import schedule_post_init_tasks
+    schedule_post_init_tasks(agent)
 
     # Register senders for enabled channels
     _register_senders(agent, config)
@@ -313,6 +328,10 @@ async def run_all_with_server(port: int = 5000):
         verbose_config = config.get("verbose", "light")
         console.set_verbose(verbose_config)
         configure_logging_for_verbose(verbose_config)
+
+    # Schedule post-initialization tasks if this is a fresh setup
+    from initialization import schedule_post_init_tasks
+    schedule_post_init_tasks(agent)
 
     # Register all senders on the server's agent
     _register_senders(agent, config)
