@@ -437,8 +437,9 @@ async def recall_realtime_webhook(
         logger.error(f"Failed to parse Recall realtime webhook: {e}")
         return {"status": "error", "message": "Invalid JSON"}
 
-    bot_id = payload.get("bot_id")
-    transcript = payload.get("transcript", {})
+    data = payload.get("data", {})
+    bot_id = data.get("bot", {}).get("id") or payload.get("bot_id")
+    transcript = data.get("data", {}) or payload.get("transcript", {})
 
     if not bot_id or not transcript:
         return {"status": "ok", "message": "no_data"}
@@ -478,10 +479,17 @@ async def recall_status_webhook(
 
     event_type = payload.get("event")
     data = payload.get("data", {})
-    bot_id = data.get("bot_id")
-    status = data.get("status", {}).get("code")
+
+    # Recall.ai nests bot ID under data.bot.id (not data.bot_id)
+    bot_id = data.get("bot", {}).get("id") or data.get("bot_id")
+    # Recall.ai nests status code under data.data.code (not data.status.code)
+    status = data.get("data", {}).get("code") or data.get("status", {}).get("code")
+    # Fall back to extracting status from event type (e.g. "bot.call_ended" → "call_ended")
+    if not status and event_type and event_type.startswith("bot."):
+        status = event_type.split(".", 1)[1]
 
     bot_short = (bot_id[:8] + "…") if bot_id else "unknown"
+    logger.debug(f"Recall status webhook payload: {payload}")
     console.activity("recall", f"bot {bot_short} → {status or 'unknown'}")
 
     # Handle meeting end - trigger post-meeting processing
@@ -560,8 +568,9 @@ async def recall_general_webhook(
     event_type = payload.get("event", "")
     console.activity("recall", f"webhook: {event_type}")
 
-    # Route to appropriate handler
-    if event_type == "bot.status_change":
+    # Route to appropriate handler — Recall.ai sends specific events like
+    # "bot.joining_call", "bot.call_ended", etc. (not a generic "bot.status_change")
+    if event_type.startswith("bot."):
         return await recall_status_webhook(request, background_tasks)
     elif event_type in ("transcript.data", "transcript.partial_data"):
         # Reconstruct request-like object for realtime handler
@@ -569,7 +578,7 @@ async def recall_general_webhook(
     elif event_type == "transcript.done":
         # Transcript done is similar to bot status done
         data = payload.get("data", {})
-        bot_id = data.get("bot_id")
+        bot_id = data.get("bot", {}).get("id") or data.get("bot_id")
         bot_short = (bot_id[:8] + "…") if bot_id else "unknown"
         console.activity("recall", f"transcript done for bot {bot_short}")
         # The status webhook will handle the actual processing when bot status changes to done
