@@ -128,7 +128,6 @@ Items that need to be addressed before public release. Organized by priority.
 - Would need: per-user threads, per-user memory namespaces, auth on API endpoints.
 
 ### Learning system conflict resolution
-- `docs/DESIGN_SELF_IMPROVEMENT.md` mentions "Learning Conflicts" as a future extension.
 - Contradictory learnings (e.g., "user likes long emails" vs "user likes short emails") aren't detected.
 
 ### Learning decay
