@@ -14,6 +14,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from utils.console import console
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,7 +46,7 @@ async def run_voice_listener(agent, config: dict = None):
     thread_id = f"voice:{session_id}"
 
     logger.info(f"Voice listener started (session: {session_id})")
-    print("\n[Voice] Listening... (Ctrl+C to stop)\n")
+    console.system("\n[Voice] Listening... (Ctrl+C to stop)\n")
 
     while True:
         try:
@@ -58,7 +60,7 @@ async def run_voice_listener(agent, config: dict = None):
             if not text or not text.strip():
                 continue
 
-            print(f"[Voice] You: {text}")
+            console.user(text, prompt="[Voice] You")
 
             # Process through agent
             response = await agent.run_async(
@@ -71,7 +73,7 @@ async def run_voice_listener(agent, config: dict = None):
                 }
             )
 
-            print(f"[Voice] Assistant: {response}")
+            console.agent(response, prefix="[Voice] Assistant")
 
             # Speak response
             await _speak(response, config)
@@ -104,7 +106,7 @@ async def _record_audio(config: dict) -> bytes | None:
     duration = config.get("max_duration", 10)
 
     try:
-        print("[Voice] Recording...")
+        console.system("[Voice] Recording...")
         audio = await asyncio.to_thread(
             sd.rec,
             int(duration * sample_rate),

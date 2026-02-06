@@ -103,9 +103,8 @@ Items that need to be addressed before public release. Organized by priority.
 - **Issue**: Many `pass` statements in exception handlers throughout the codebase. Some are intentional (catching expected failures gracefully), others may be hiding bugs.
 - **Recommendation**: Review each and add a comment explaining why the exception is intentionally swallowed, or add logging.
 
-### Logging infrastructure
-- **Issue**: The codebase uses `print()` and `console.*` for output but has no structured logging (`import logging`). For production use, structured logs (JSON) would be valuable.
-- **Recommendation**: Add `logging.getLogger(__name__)` to key modules with configurable log levels.
+### ~~Logging infrastructure~~ (Done)
+- **Resolution**: All modules now use `logging.getLogger(__name__)` with configurable levels. Error-handling `print()` calls replaced with `logger.warning()`/`logger.error()`. User-facing output standardized on `console.*` methods. Two-tier strategy (Python logging for ops, console for UX) documented in [ARCHITECTURE.md](ARCHITECTURE.md#logging-strategy).
 
 ### Type annotations
 - **Issue**: Some functions lack return type annotations, especially in `tools/` modules.
@@ -160,4 +159,4 @@ Items that need to be addressed before public release. Organized by priority.
 - [x] Add optional dependency group for voice
 - [x] Remove unused `import asyncio` in `tools/research.py`
 - [x] Implement file search semantic integration
-- [ ] Add structured logging
+- [x] Add structured logging
