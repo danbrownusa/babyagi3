@@ -19,7 +19,9 @@ from .learning import (
     FeedbackExtractor,
     ObjectiveEvaluator,
     PreferenceSummarizer,
+    ToolErrorAnalyzer,
     ensure_user_preferences_node,
+    resolve_contradictions,
 )
 
 
@@ -280,6 +282,7 @@ def setup_memory_hooks(agent, memory):
 
                 for learning in learnings:
                     memory.store.create_learning(learning)
+                    resolve_contradictions(learning, memory.store)
 
                 # Trigger preference summary update if learnings were generated
                 if learnings:
@@ -393,6 +396,7 @@ def setup_feedback_extraction(agent, memory):
 
             if learning:
                 memory.store.create_learning(learning)
+                resolve_contradictions(learning, memory.store)
                 # Trigger preference summary update
                 memory.store.increment_staleness("user_preferences")
                 logger.debug("Extracted learning from feedback: %s...", learning.content[:50])
@@ -713,7 +717,6 @@ def create_enhanced_memory_tool(memory):
                             "tool_id": l.tool_id,
                             "objective_type": l.objective_type,
                             "recommendation": l.recommendation,
-                            "times_applied": l.times_applied,
                             "created_at": l.created_at.isoformat() if l.created_at else None,
                         }
                         for l in learnings
@@ -923,6 +926,18 @@ def create_extraction_background_task(
 
                         # Brief yield between batches to let other tasks run
                         await asyncio.sleep(1)
+
+                # Convert tool error stats into learnings + fix tasks
+                try:
+                    analyzer = ToolErrorAnalyzer()
+                    error_learnings = analyzer.analyze_and_fix(memory.store)
+                    for learning in error_learnings:
+                        memory.store.create_learning(learning)
+                        resolve_contradictions(learning, memory.store)
+                    if error_learnings:
+                        memory.store.increment_staleness("user_preferences")
+                except Exception as e:
+                    logger.debug("Tool error analysis skipped: %s", e)
 
                 # Refresh stale summaries (less frequently)
                 await memory.refresh_stale_summaries(threshold=10)

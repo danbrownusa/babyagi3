@@ -428,7 +428,40 @@ class TestLearning:
         )
         assert l.sentiment == "neutral"
         assert l.confidence == 0.5
-        assert l.category == "general"
+        assert l.tool_id is None
+        assert l.recommendation is None
+        assert l.superseded_by is None
+
+    def test_creation_with_tool(self):
+        l = Learning(
+            id="learn2",
+            source_type="tool_error_pattern",
+            content="Tool X has 40% success rate",
+            tool_id="tool_x",
+            sentiment="negative",
+            confidence=0.8,
+            recommendation="Validate parameters before use",
+        )
+        assert l.tool_id == "tool_x"
+        assert l.recommendation == "Validate parameters before use"
+
+    def test_superseded_by(self):
+        old = Learning(
+            id="old1",
+            source_type="user_feedback",
+            content="Keep emails long and detailed",
+            sentiment="positive",
+        )
+        new = Learning(
+            id="new1",
+            source_type="user_feedback",
+            content="Keep emails short",
+            sentiment="negative",
+        )
+        # Simulate supersession
+        old.superseded_by = new.id
+        assert old.superseded_by == "new1"
+        assert new.superseded_by is None
 
     def test_repr(self):
         l = Learning(

@@ -586,8 +586,10 @@ def _build_learnings_context(
 ) -> list[dict]:
     """Build context-specific learnings based on current event.
 
-    When no event is provided (e.g., session start), includes high-confidence
-    negative learnings to prevent repeating known mistakes.
+    Uses decay-weighted retrieval so recent learnings dominate while
+    old ones fade.  When no event is provided (e.g., session start),
+    surfaces high-confidence negative learnings to prevent repeating
+    known mistakes.
     """
     budget = config.token_budgets.get("learnings", 200)
     learnings = []
@@ -601,29 +603,26 @@ def _build_learnings_context(
         if event:
             # If using a specific tool, get tool-specific learnings
             if event.tool_id:
-                tool_learnings = retriever.get_for_tool(event.tool_id, limit=3)
-                for l in tool_learnings:
+                for l in retriever.get_for_tool(event.tool_id, limit=3):
                     learnings.append({
                         "type": "tool",
                         "tool": event.tool_id,
                         "learning": l.content[:200],
                         "recommendation": l.recommendation[:100] if l.recommendation else None,
                     })
-                    store.record_learning_applied(l.id)
 
             # If this looks like an objective start, get similar objective learnings
             if event.event_type in ["objective_start", "task_created"]:
-                obj_learnings = retriever.get_for_objective(event.content, limit=3)
-                for l in obj_learnings:
+                seen_tools = {d["tool"] for d in learnings if d.get("tool")}
+                for l in retriever.get_for_objective(event.content, limit=3):
                     # Avoid duplicates from tool learnings
-                    if l.tool_id and event.tool_id and l.tool_id == event.tool_id:
+                    if l.tool_id and l.tool_id in seen_tools:
                         continue
                     learnings.append({
                         "type": "objective",
                         "learning": l.content[:200],
                         "recommendation": l.recommendation[:100] if l.recommendation else None,
                     })
-                    store.record_learning_applied(l.id)
         else:
             # Session start: surface high-confidence negative learnings
             # to prevent repeating known mistakes
@@ -637,7 +636,6 @@ def _build_learnings_context(
                         "learning": l.content[:200],
                         "recommendation": l.recommendation[:100] if l.recommendation else None,
                     })
-                    store.record_learning_applied(l.id)
 
     except Exception as e:
         # Don't fail context assembly if learnings fail

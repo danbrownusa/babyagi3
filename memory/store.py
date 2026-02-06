@@ -189,18 +189,25 @@ class MemoryStore:
         self.conn.commit()
 
     def _migrate_learnings(self):
-        """Add category column to learnings table for existing databases."""
+        """Add columns to learnings table for existing databases."""
         cur = self.conn.cursor()
         cur.execute("PRAGMA table_info(learnings)")
         existing_columns = {row["name"] for row in cur.fetchall()}
-        if "category" not in existing_columns:
-            try:
-                cur.execute(
-                    "ALTER TABLE learnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'"
-                )
-                self.conn.commit()
-            except sqlite3.OperationalError:
-                pass
+
+        migrations = {
+            "category": "TEXT NOT NULL DEFAULT 'general'",
+            "superseded_by": "TEXT",  # ID of the learning that replaced this one
+        }
+        for col_name, col_def in migrations.items():
+            if col_name not in existing_columns:
+                try:
+                    cur.execute(
+                        f"ALTER TABLE learnings ADD COLUMN {col_name} {col_def}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+        self.conn.commit()
 
     def _create_tables(self):
         """Create all tables."""
@@ -3802,7 +3809,11 @@ class MemoryStore:
     # ═══════════════════════════════════════════════════════════
 
     def create_learning(self, learning: Learning) -> Learning:
-        """Create a new learning from feedback or evaluation."""
+        """Create a new learning from feedback or evaluation.
+
+        Writes to the full DB schema for backward compatibility — unused
+        legacy columns get default/null values.
+        """
         cur = self.conn.cursor()
         now = now_iso()
 
@@ -3816,8 +3827,8 @@ class MemoryStore:
             (id, source_type, source_event_id, content, content_embedding,
              sentiment, confidence, category, tool_id, topic_ids, objective_type,
              entity_ids, applies_when, recommendation, times_applied,
-             last_applied_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             last_applied_at, superseded_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 learning.id,
@@ -3827,15 +3838,16 @@ class MemoryStore:
                 serialize_embedding(learning.content_embedding),
                 learning.sentiment,
                 learning.confidence,
-                learning.category,
+                "general",  # legacy column
                 learning.tool_id,
-                serialize_json(learning.topic_ids),
+                "[]",  # legacy column
                 learning.objective_type,
-                serialize_json(learning.entity_ids),
-                learning.applies_when,
+                "[]",  # legacy column
+                None,  # legacy column
                 learning.recommendation,
-                learning.times_applied,
-                learning.last_applied_at.isoformat() if learning.last_applied_at else None,
+                0,  # legacy column
+                None,  # legacy column
+                learning.superseded_by,
                 now,
                 now,
             ),
@@ -3856,14 +3868,21 @@ class MemoryStore:
         objective_type: str | None = None,
         sentiment: str | None = None,
         source_type: str | None = None,
-        category: str | None = None,
+        include_superseded: bool = False,
         limit: int = 20,
     ) -> list[Learning]:
-        """Find learnings by filters."""
+        """Find learnings by filters.
+
+        By default excludes superseded learnings — pass
+        include_superseded=True to see the full history.
+        """
         cur = self.conn.cursor()
 
         query = "SELECT * FROM learnings WHERE 1=1"
         params = []
+
+        if not include_superseded:
+            query += " AND superseded_by IS NULL"
 
         if tool_id:
             query += " AND tool_id = ?"
@@ -3877,9 +3896,6 @@ class MemoryStore:
         if source_type:
             query += " AND source_type = ?"
             params.append(source_type)
-        if category:
-            query += " AND category = ?"
-            params.append(category)
 
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -3898,11 +3914,12 @@ class MemoryStore:
 
         Uses cosine similarity on content_embedding.
         Falls back to recent learnings if no embeddings available.
+        Excludes superseded learnings.
         """
         cur = self.conn.cursor()
 
         # Build filter conditions
-        conditions = ["content_embedding IS NOT NULL"]
+        conditions = ["content_embedding IS NOT NULL", "superseded_by IS NULL"]
         params = []
 
         if tool_id:
@@ -3939,12 +3956,12 @@ class MemoryStore:
         return [self._row_to_learning(row) for _, row in scored[:limit]]
 
     def get_learnings_for_tool(self, tool_id: str, limit: int = 5) -> list[Learning]:
-        """Get learnings specific to a tool, prioritizing corrections."""
+        """Get active learnings specific to a tool, prioritizing corrections."""
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT * FROM learnings
-            WHERE tool_id = ?
+            WHERE tool_id = ? AND superseded_by IS NULL
             ORDER BY
                 CASE sentiment WHEN 'negative' THEN 0 ELSE 1 END,
                 created_at DESC
@@ -3954,28 +3971,50 @@ class MemoryStore:
         )
         return [self._row_to_learning(row) for row in cur.fetchall()]
 
-    def get_all_learnings(self, limit: int = 100) -> list[Learning]:
+    def get_all_learnings(self, limit: int = 100, include_superseded: bool = False) -> list[Learning]:
         """Get all learnings, ordered by recency."""
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT * FROM learnings ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        if include_superseded:
+            cur.execute(
+                "SELECT * FROM learnings ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM learnings WHERE superseded_by IS NULL ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
         return [self._row_to_learning(row) for row in cur.fetchall()]
 
-    def record_learning_applied(self, learning_id: str):
-        """Record that a learning was used in context."""
+    def supersede_learning(self, old_id: str, new_id: str):
+        """Mark an old learning as superseded by a newer one.
+
+        The old learning stays in the DB for history tracking (preferences
+        can flip-flop) but is excluded from retrieval by default.
+        """
         cur = self.conn.cursor()
         now = now_iso()
         cur.execute(
             """
             UPDATE learnings
-            SET times_applied = times_applied + 1,
-                last_applied_at = ?,
-                updated_at = ?
+            SET superseded_by = ?, updated_at = ?
             WHERE id = ?
         """,
-            (now, now, learning_id),
+            (new_id, now, old_id),
+        )
+        self.conn.commit()
+
+    def touch_learning(self, learning_id: str):
+        """Refresh updated_at so the learning's decay weight resets.
+
+        Call this when a learning is surfaced in context and proves useful —
+        keeps frequently-relevant learnings from decaying away.
+        """
+        cur = self.conn.cursor()
+        now = now_iso()
+        cur.execute(
+            "UPDATE learnings SET updated_at = ? WHERE id = ?",
+            (now, learning_id),
         )
         self.conn.commit()
 
@@ -4033,11 +4072,11 @@ class MemoryStore:
 
     def _row_to_learning(self, row: sqlite3.Row) -> Learning:
         """Convert a database row to a Learning."""
-        # Handle databases created before the category column was added
+        # Handle databases before superseded_by migration
         try:
-            category = row["category"]
+            superseded_by = row["superseded_by"]
         except (IndexError, KeyError):
-            category = "general"
+            superseded_by = None
 
         return Learning(
             id=row["id"],
@@ -4047,15 +4086,10 @@ class MemoryStore:
             content_embedding=deserialize_embedding(row["content_embedding"]),
             sentiment=row["sentiment"],
             confidence=row["confidence"],
-            category=category,
             tool_id=row["tool_id"],
-            topic_ids=deserialize_json(row["topic_ids"]) or [],
             objective_type=row["objective_type"],
-            entity_ids=deserialize_json(row["entity_ids"]) or [],
-            applies_when=row["applies_when"],
             recommendation=row["recommendation"],
-            times_applied=row["times_applied"],
-            last_applied_at=parse_datetime(row["last_applied_at"]),
+            superseded_by=superseded_by,
             created_at=parse_datetime(row["created_at"]),
             updated_at=parse_datetime(row["updated_at"]),
         )

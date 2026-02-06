@@ -462,45 +462,40 @@ class Learning:
     Learnings are extracted from:
     - User feedback in messages (corrections, preferences, complaints)
     - Self-evaluation of completed objectives
-    - Direct observations
+    - Tool error pattern analysis
 
-    They are stored with embeddings for vector search and tied to:
-    - Specific tools (how to use them better)
-    - Objective types (how to approach similar tasks)
-    - Topics (domain-specific knowledge)
-    - Entities (person-specific preferences)
+    Content contains the full learning text (what happened + context).
+    Recommendation contains the actionable "do this instead" instruction.
+    Tool-specific learnings are identified by tool_id being set.
     """
 
     id: str
 
     # Source
-    source_type: str  # "user_feedback", "self_evaluation", "observation"
-    source_event_id: str | None  # Event that triggered this learning
+    source_type: str  # "user_feedback", "self_evaluation", "tool_error_pattern"
+    source_event_id: str | None = None  # Event that triggered this learning
 
     # Content
-    content: str  # The actual learning/insight
+    content: str = ""  # The actual learning/insight
     content_embedding: list[float] | None = None  # For vector search
 
     # Classification
     sentiment: str = "neutral"  # "positive", "negative", "neutral"
     confidence: float = 0.5  # 0-1, how confident we are in this learning
-    category: str = "general"  # "general", "owner_profile", "agent_self", "tool_feedback"
 
-    # Associations (what this learning is about)
+    # Associations
     tool_id: str | None = None  # If about a specific tool
-    topic_ids: list[str] = field(default_factory=list)  # Related topics
     objective_type: str | None = None  # Type of objective (e.g., "research", "code", "email")
-    entity_ids: list[str] = field(default_factory=list)  # Related entities (people, orgs)
 
     # Actionable insight
-    applies_when: str | None = None  # Condition when this learning applies
     recommendation: str | None = None  # What to do differently
 
-    # Stats
-    times_applied: int = 0  # How often this learning was used in context
-    last_applied_at: datetime | None = None
+    # Contradiction tracking — superseded learnings stay in DB for history
+    # but are excluded from retrieval by default
+    superseded_by: str | None = None  # ID of the learning that replaced this one
 
-    # Timestamps
+    # Timestamps — updated_at is refreshed when a learning is surfaced
+    # in context (re-boosts decay weight so useful learnings stay alive)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -523,10 +518,8 @@ class ExtractedFeedback:
 
     has_feedback: bool = False
     feedback_type: str | None = None  # "correction", "praise", "preference", "complaint", "profile_info"
-    category: str = "general"  # "general", "owner_profile", "agent_self", "tool_feedback"
     about_tool: str | None = None
     about_objective_type: str | None = None
-    about_entity_id: str | None = None
     what_was_wrong: str | None = None
     what_to_do_instead: str | None = None
     sentiment: str = "neutral"
