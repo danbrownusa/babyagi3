@@ -309,6 +309,19 @@ class Console:
             msg += f": {detail[:50]}"
         self.verbose(msg, VerboseLevel.DEEP, "memory")
 
+    def activity(self, channel: str, detail: str):
+        """Log cross-channel or webhook activity.
+
+        Replaces raw uvicorn/HTTP access logs with styled, concise output.
+        Only shown at LIGHT verbose level and above.
+
+        Examples:
+            console.activity("sendblue", "inbound message from +1234567890")
+            console.activity("recall", "bot status → in_call_recording")
+            console.activity("email", "new message from user@example.com")
+        """
+        self.verbose(f"[{channel}] {detail}", VerboseLevel.LIGHT, "activity")
+
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
