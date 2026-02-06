@@ -22,6 +22,39 @@ That's it. You now have a persistent AI agent with memory, scheduling, backgroun
 
 Verbose mode is on by default — you'll see tool calls, webhook activity, and background operations as they happen. To turn it off, just tell the agent "turn off verbose" or type `/verbose off`.
 
+## Initialization
+
+On first run, BabyAGI starts an LLM-powered setup conversation. It detects that no `~/.babyagi/initialized` marker exists and launches an interactive onboarding chat before starting the agent.
+
+The setup assistant has full context about how BabyAGI works — you can ask it questions ("what does AgentMail do?", "do I need SendBlue?", "how does memory work?") and provide your info in any order. It guides you conversationally and calls a `complete_initialization` tool when it has everything it needs.
+
+### What gets collected
+
+At minimum, the assistant needs your **name** and **email**. It will also walk you through setting up:
+
+- **Email channel ([AgentMail](https://agentmail.to))** — gives your agent its own email address for sending reports, handling signups, and email communication. Free tier available.
+- **SMS/iMessage channel ([SendBlue](https://sendblue.co))** — lets you text your agent from your phone. Needs an API key, secret, and your phone number.
+
+### What gets set up automatically
+
+Once the wizard finishes, two recurring tasks are scheduled:
+
+- **Daily Stats Report** — compiles tool usage, memory extraction counts, LLM costs by model/source, scheduled task statuses, and errors from the last 24 hours. Emails the report to you. First run is ~5 minutes after setup, then every 24 hours.
+- **Daily Self-Improvement** — the agent picks one concrete action each day to become more helpful: create a new skill, set up a useful scheduled task, or ask you a question to better understand your needs. It tracks past actions in memory to avoid repetition.
+
+### Re-running initialization
+
+Delete the marker file and restart:
+
+```bash
+rm ~/.babyagi/initialized
+python main.py
+```
+
+Or skip the wizard entirely and configure manually via `config.yaml` and environment variables (see [Configuration](#configuration) below).
+
+---
+
 ## What You Can Ask For
 
 Everything below is done through natural conversation. The agent decides which tools to use.
