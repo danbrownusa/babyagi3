@@ -1,13 +1,16 @@
 """
 Self-improvement system for the memory system.
 
-Extracts learnings from feedback and self-evaluation, retrieves relevant
-learnings for context, and summarizes them into user preferences.
+Extracts learnings from feedback, self-evaluation, and tool error patterns.
+Retrieves relevant learnings with age-based decay weighting.
+Resolves contradictions when new learnings supersede old ones.
+Prunes stale learnings after preference summarization.
 """
 
 import json
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -20,6 +23,95 @@ from .models import Event, ExtractedFeedback, Learning
 def generate_id() -> str:
     """Generate a unique ID."""
     return str(uuid4())
+
+
+# Half-life in days for learning decay. A learning's weight drops to 50%
+# after this many days, ~25% after 2x, etc.  Keeps recent corrections
+# prominent while old ones gracefully fade.
+DECAY_HALF_LIFE_DAYS = 14
+
+# Similarity threshold for contradiction detection.  Two learnings about
+# the same tool/topic with cosine similarity above this are considered
+# the same topic — if the newer one has opposite sentiment, the old one
+# gets superseded (deleted).
+CONTRADICTION_SIMILARITY_THRESHOLD = 0.82
+
+# Maximum learnings to keep.  After preference summarization consolidates
+# the knowledge, learnings older than MAX_LEARNING_AGE_DAYS are pruned.
+MAX_LEARNING_AGE_DAYS = 60
+MAX_LEARNINGS_COUNT = 200
+
+
+def decay_weight(learning: Learning, now: datetime | None = None) -> float:
+    """Calculate age-based decay weight for a learning (0-1).
+
+    Uses exponential decay with a configurable half-life so recent
+    learnings dominate retrieval while old ones fade gracefully.
+    """
+    now = now or datetime.now()
+    if not learning.created_at:
+        return 0.5
+    age_days = max((now - learning.created_at).total_seconds() / 86400, 0)
+    return math.exp(-0.693 * age_days / DECAY_HALF_LIFE_DAYS)  # ln(2) ≈ 0.693
+
+
+# ═══════════════════════════════════════════════════════════
+# CONTRADICTION RESOLUTION
+# ═══════════════════════════════════════════════════════════
+
+
+def resolve_contradictions(new_learning: Learning, store) -> list[str]:
+    """Find and delete learnings that the new one supersedes.
+
+    Two learnings contradict when they are about the same topic
+    (high embedding similarity + same tool_id) but express opposite
+    sentiment.  The newer learning wins.
+
+    Returns list of superseded learning IDs.
+    """
+    if not new_learning.content_embedding:
+        return []
+
+    # Search for similar existing learnings
+    similar = store.search_learnings(
+        new_learning.content_embedding,
+        tool_id=new_learning.tool_id,
+        limit=5,
+    )
+
+    superseded = []
+    for existing in similar:
+        if existing.id == new_learning.id:
+            continue
+        if not existing.content_embedding:
+            continue
+
+        similarity = store._cosine_similarity(
+            new_learning.content_embedding, existing.content_embedding
+        )
+        if similarity < CONTRADICTION_SIMILARITY_THRESHOLD:
+            continue
+
+        # Same topic area — check for contradiction
+        same_scope = new_learning.tool_id == existing.tool_id
+        opposite_sentiment = (
+            new_learning.sentiment != existing.sentiment
+            and new_learning.sentiment != "neutral"
+            and existing.sentiment != "neutral"
+        )
+
+        if same_scope and opposite_sentiment:
+            store.delete_learning(existing.id)
+            superseded.append(existing.id)
+            logger.debug(
+                "Superseded learning %s (sim=%.2f, %s→%s)",
+                existing.id[:8],
+                similarity,
+                existing.sentiment,
+                new_learning.sentiment,
+            )
+
+    return superseded
 
 
 # ═══════════════════════════════════════════════════════════
@@ -53,10 +145,6 @@ class FeedbackExtractor:
         """
         Analyze a user message for feedback about prior work.
 
-        Args:
-            event: The incoming user message event
-            recent_events: Recent AI actions for context
-
         Returns:
             Learning if feedback detected, None otherwise
         """
@@ -76,13 +164,6 @@ class FeedbackExtractor:
         # Create learning from feedback
         content = self._format_learning_content(feedback)
 
-        # Determine category — use LLM-classified category, validate it
-        valid_categories = {"general", "owner_profile", "agent_self", "tool_feedback"}
-        category = feedback.category if feedback.category in valid_categories else "general"
-        # Auto-classify tool feedback if tool is referenced
-        if feedback.about_tool and category == "general":
-            category = "tool_feedback"
-
         learning = Learning(
             id=generate_id(),
             source_type="user_feedback",
@@ -91,13 +172,9 @@ class FeedbackExtractor:
             content_embedding=get_embedding(content),
             sentiment=feedback.sentiment,
             confidence=feedback.confidence,
-            category=category,
             tool_id=feedback.about_tool,
             objective_type=feedback.about_objective_type,
-            applies_when=feedback.what_was_wrong,
             recommendation=feedback.what_to_do_instead,
-            topic_ids=[],
-            entity_ids=[feedback.about_entity_id] if feedback.about_entity_id else [],
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
@@ -156,15 +233,12 @@ RECENT AI ACTIONS:
 Determine if the message contains feedback (correction, praise, preference, complaint) about:
 - A specific tool that was used
 - A type of task/objective
-- General working style
-- Owner profile info (facts about themselves: location, interests, schedule, role, etc.)
-- Agent self-improvement (how the agent should behave, its role, boundaries)
+- General working style or behavior
 
 Return JSON:
 {{
     "has_feedback": true/false,
     "feedback_type": "correction" | "praise" | "preference" | "complaint" | "profile_info" | null,
-    "category": "general" | "owner_profile" | "agent_self" | "tool_feedback",
     "about_tool": "tool_name or null",
     "about_objective_type": "research/code/email/communication/etc or null",
     "what_was_wrong": "description of issue or null",
@@ -173,19 +247,11 @@ Return JSON:
     "confidence": 0.0-1.0
 }}
 
-Category guide:
-- "owner_profile": facts about the owner (interests, timezone, role, preferences, schedule)
-- "agent_self": how the agent should behave, its boundaries, role definition
-- "tool_feedback": feedback about a specific tool's usage
-- "general": everything else (work style, communication, general preferences)
-
 Examples of feedback:
-- "Actually, I prefer shorter emails" → preference, category=general
-- "I'm a VC focused on AI startups" → profile_info, category=owner_profile
-- "Don't spend money without asking me" → preference, category=agent_self
-- "Don't use that API, use X instead" → correction, category=tool_feedback
-- "I'm usually free after 3pm Pacific" → profile_info, category=owner_profile
-- "You should always check my calendar before scheduling" → preference, category=agent_self
+- "Actually, I prefer shorter emails" → preference
+- "Don't use that API, use X instead" → correction, about_tool
+- "I'm usually free after 3pm Pacific" → profile_info
+- "You should always check my calendar before scheduling" → preference
 
 Return only valid JSON, no other text."""
 
@@ -210,7 +276,6 @@ Return only valid JSON, no other text."""
             return ExtractedFeedback(
                 has_feedback=data.get("has_feedback", False),
                 feedback_type=data.get("feedback_type"),
-                category=data.get("category", "general"),
                 about_tool=data.get("about_tool"),
                 about_objective_type=data.get("about_objective_type"),
                 what_was_wrong=data.get("what_was_wrong"),
@@ -269,13 +334,6 @@ class ObjectiveEvaluator:
         """
         Evaluate a completed objective to generate learnings.
 
-        Args:
-            objective_id: ID of the objective
-            goal: The objective's goal text
-            status: Final status (completed/failed)
-            result: Result or error message
-            events: Events from this objective's execution
-
         Returns:
             List of learnings extracted from the evaluation
         """
@@ -305,11 +363,8 @@ class ObjectiveEvaluator:
 
             applies_to = item.get("applies_to", "general")
 
-            # Determine category for self-evaluation learnings
-            if applies_to not in ["objective_type", "general"]:
-                eval_category = "tool_feedback"
-            else:
-                eval_category = "agent_self"
+            # Determine tool_id from applies_to
+            tool_id = applies_to if applies_to not in ["objective_type", "general"] else None
 
             learning = Learning(
                 id=generate_id(),
@@ -319,12 +374,9 @@ class ObjectiveEvaluator:
                 content_embedding=get_embedding(insight),
                 sentiment=item.get("sentiment", "neutral"),
                 confidence=evaluation.get("overall_score", 5) / 10.0,
-                category=eval_category,
-                tool_id=applies_to if applies_to not in ["objective_type", "general"] else None,
+                tool_id=tool_id,
                 objective_type=objective_type if applies_to == "objective_type" else None,
                 recommendation=item.get("recommendation"),
-                topic_ids=[],
-                entity_ids=[],
                 created_at=datetime.now(),
                 updated_at=datetime.now(),
             )
@@ -457,48 +509,115 @@ Return only valid JSON, no other text."""
 
 
 # ═══════════════════════════════════════════════════════════
-# LEARNING RETRIEVAL
+# TOOL ERROR ANALYSIS
+# ═══════════════════════════════════════════════════════════
+
+
+class ToolErrorAnalyzer:
+    """Converts tool error statistics into learnings.
+
+    Runs periodically to check for tools with poor success rates or
+    high error counts and creates learnings so the agent can adapt
+    its behavior (e.g., validate parameters, prefer alternative tools).
+    """
+
+    def generate_learnings(self, store) -> list[Learning]:
+        """Create learnings from unhealthy/problematic tool stats.
+
+        Skips tools that already have a recent tool_error_pattern learning
+        to avoid duplicating the same signal.
+        """
+        try:
+            unhealthy = store.get_unhealthy_tools()
+            problematic = store.get_problematic_tools(error_threshold=3)
+        except Exception as e:
+            logger.warning("Could not fetch tool stats for learning: %s", e)
+            return []
+
+        # Deduplicate by name
+        seen = set()
+        tools = []
+        for t in unhealthy + problematic:
+            if t.name not in seen:
+                seen.add(t.name)
+                tools.append(t)
+
+        learnings = []
+        for tool in tools:
+            # Skip if we already have a recent learning about this tool
+            existing = store.find_learnings(tool_id=tool.name, limit=1)
+            if existing:
+                age_days = (datetime.now() - existing[0].created_at).total_seconds() / 86400
+                if age_days < 7:
+                    continue  # Recent enough, skip
+
+            content = (
+                f"Tool '{tool.name}' has a {tool.success_rate:.0f}% success rate "
+                f"({tool.error_count} errors out of {tool.usage_count} uses)."
+            )
+            recommendation = None
+            if tool.last_error:
+                content += f" Last error: {tool.last_error[:200]}"
+                recommendation = (
+                    f"Be cautious with '{tool.name}'. "
+                    f"Validate parameters before use or consider alternatives."
+                )
+
+            learning = Learning(
+                id=generate_id(),
+                source_type="tool_error_pattern",
+                content=content,
+                content_embedding=get_embedding(content),
+                sentiment="negative",
+                confidence=min(tool.usage_count / 10.0, 1.0),
+                tool_id=tool.name,
+                recommendation=recommendation,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+            learnings.append(learning)
+
+        return learnings
+
+
+# ═══════════════════════════════════════════════════════════
+# LEARNING RETRIEVAL (with decay weighting)
 # ═══════════════════════════════════════════════════════════
 
 
 class LearningRetriever:
-    """Retrieves relevant learnings for context assembly."""
+    """Retrieves relevant learnings for context assembly.
+
+    All retrieval methods weight results by age-based decay so that
+    recent learnings dominate while old ones fade.
+    """
 
     def __init__(self, store):
         self.store = store
 
     def get_for_tool(self, tool_name: str, limit: int = 3) -> list[Learning]:
-        """
-        Get learnings specific to a tool.
-
-        Prioritizes negative sentiment (corrections) over positive.
-        """
-        return self.store.get_learnings_for_tool(tool_name, limit=limit)
+        """Get learnings specific to a tool, weighted by decay."""
+        learnings = self.store.get_learnings_for_tool(tool_name, limit=limit * 2)
+        return self._rank_by_decay(learnings)[:limit]
 
     def get_for_objective(self, goal: str, limit: int = 5) -> list[Learning]:
-        """
-        Get learnings relevant to an objective via vector search.
-
-        Searches by goal text similarity.
-        """
+        """Get learnings relevant to an objective via vector search + decay."""
         embedding = get_embedding(goal)
-        return self.store.search_learnings(embedding=embedding, limit=limit)
+        learnings = self.store.search_learnings(embedding=embedding, limit=limit * 2)
+        return self._rank_by_decay(learnings)[:limit]
 
     def get_for_objective_type(
         self, objective_type: str, limit: int = 3
     ) -> list[Learning]:
         """Get learnings for a specific objective type."""
-        return self.store.find_learnings(
+        learnings = self.store.find_learnings(
             objective_type=objective_type,
-            limit=limit,
+            limit=limit * 2,
         )
+        return self._rank_by_decay(learnings)[:limit]
 
     def get_user_preferences(self) -> str:
-        """
-        Get summarized user preferences.
-
-        Returns the summary from the user_preferences summary node.
-        """
+        """Get summarized user preferences."""
         node = self.store.get_summary_node("user_preferences")
         return node.summary if node else ""
 
@@ -506,38 +625,41 @@ class LearningRetriever:
         """Get most recent learnings regardless of type."""
         return self.store.find_learnings(limit=limit)
 
-    def get_by_category(self, category: str, limit: int = 5) -> list[Learning]:
-        """Get learnings for a specific category (owner_profile, agent_self, etc.)."""
-        return self.store.find_learnings(category=category, limit=limit)
-
     def format_for_context(self, learnings: list[Learning]) -> list[dict]:
         """Format learnings for inclusion in AssembledContext."""
         result = []
         for learning in learnings:
             entry = {
                 "learning": learning.content,
-                "type": "tool" if learning.tool_id else learning.category,
+                "type": "tool" if learning.tool_id else "general",
             }
             if learning.tool_id:
                 entry["tool"] = learning.tool_id
             if learning.recommendation:
                 entry["recommendation"] = learning.recommendation
 
-            # Record that this learning was applied
-            self.store.record_learning_applied(learning.id)
-
             result.append(entry)
 
         return result
 
+    def _rank_by_decay(self, learnings: list[Learning]) -> list[Learning]:
+        """Re-rank learnings by confidence * decay_weight."""
+        now = datetime.now()
+        scored = [
+            (l.confidence * decay_weight(l, now), l)
+            for l in learnings
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [l for _, l in scored]
+
 
 # ═══════════════════════════════════════════════════════════
-# PREFERENCE SUMMARIZATION
+# PREFERENCE SUMMARIZATION (with pruning)
 # ═══════════════════════════════════════════════════════════
 
 
 class PreferenceSummarizer:
-    """Summarizes learnings into user preferences."""
+    """Summarizes learnings into user preferences and prunes stale ones."""
 
     def __init__(self):
         self._client = None
@@ -556,81 +678,84 @@ class PreferenceSummarizer:
 
     async def refresh_preferences(self, store) -> str:
         """
-        Regenerate the user preferences summary from all learnings.
-
-        Args:
-            store: MemoryStore instance
+        Regenerate the user preferences summary from all learnings,
+        then prune stale ones that have been consolidated.
 
         Returns:
             New preferences summary text
         """
-        # Get all learnings, prioritize negatives and recent
+        # Get all learnings, prioritize recent
         learnings = store.get_all_learnings(limit=50)
 
         if not learnings:
             return "No user preferences recorded yet."
 
-        # Group learnings by category
-        grouped = self._group_learnings(learnings)
-
         # Format for prompt
-        learnings_text = self._format_learnings(grouped)
+        learnings_text = self._format_learnings(learnings)
 
         # Generate summary
-        return await self._llm_summarize(learnings_text)
+        summary = await self._llm_summarize(learnings_text)
 
-    def _group_learnings(self, learnings: list[Learning]) -> dict:
-        """Group learnings by category for summarization.
+        # Prune stale learnings now that knowledge is consolidated
+        self._prune_stale(store)
 
-        Uses the Learning.category field first, then falls back to
-        heuristic grouping for uncategorized learnings.
+        return summary
+
+    def _format_learnings(self, learnings: list[Learning]) -> str:
+        """Format learnings for the summary prompt."""
+        items = []
+        for l in learnings:
+            sentiment_marker = (
+                "[+]" if l.sentiment == "positive"
+                else "[-]" if l.sentiment == "negative"
+                else "[~]"
+            )
+            line = f"  {sentiment_marker} {l.content}"
+            if l.recommendation:
+                line += f"\n      → {l.recommendation}"
+            if l.tool_id:
+                line += f"  [tool: {l.tool_id}]"
+            items.append(line)
+
+        return "\n".join(items)
+
+    def _prune_stale(self, store):
+        """Delete learnings that are old and have been consolidated.
+
+        Keeps learnings under MAX_LEARNINGS_COUNT and removes anything
+        older than MAX_LEARNING_AGE_DAYS.
         """
-        groups = {
-            "owner_profile": [],
-            "agent_self": [],
-            "tool_preferences": [],
-            "communication_style": [],
-            "work_approach": [],
-            "general": [],
-        }
+        try:
+            all_learnings = store.get_all_learnings(limit=MAX_LEARNINGS_COUNT + 100)
 
-        for learning in learnings:
-            # Use explicit category first
-            if learning.category == "owner_profile":
-                groups["owner_profile"].append(learning)
-            elif learning.category == "agent_self":
-                groups["agent_self"].append(learning)
-            elif learning.category == "tool_feedback" or learning.tool_id:
-                groups["tool_preferences"].append(learning)
-            # Fall back to heuristic grouping
-            elif learning.objective_type in ["email", "communication"]:
-                groups["communication_style"].append(learning)
-            elif learning.objective_type in ["research", "code", "data"]:
-                groups["work_approach"].append(learning)
-            else:
-                groups["general"].append(learning)
+            if len(all_learnings) <= MAX_LEARNINGS_COUNT:
+                # Only prune by age
+                cutoff = datetime.now() - timedelta(days=MAX_LEARNING_AGE_DAYS)
+                for l in all_learnings:
+                    if l.created_at and l.created_at < cutoff:
+                        store.delete_learning(l.id)
+                return
 
-        return groups
+            # Over the cap — keep the top MAX_LEARNINGS_COUNT by score,
+            # delete the rest
+            now = datetime.now()
+            scored = [
+                (l.confidence * decay_weight(l, now), l)
+                for l in all_learnings
+            ]
+            scored.sort(key=lambda x: x[0], reverse=True)
 
-    def _format_learnings(self, grouped: dict) -> str:
-        """Format grouped learnings for the summary prompt."""
-        sections = []
+            to_keep = {l.id for _, l in scored[:MAX_LEARNINGS_COUNT]}
+            for l in all_learnings:
+                if l.id not in to_keep:
+                    store.delete_learning(l.id)
 
-        for category, learnings in grouped.items():
-            if not learnings:
-                continue
+            pruned = len(all_learnings) - len(to_keep)
+            if pruned > 0:
+                logger.info("Pruned %d stale learnings", pruned)
 
-            category_name = category.replace("_", " ").title()
-            items = []
-            for l in learnings[:10]:  # Limit per category
-                sentiment_marker = "[+]" if l.sentiment == "positive" else "[-]" if l.sentiment == "negative" else "[~]"
-                items.append(f"  {sentiment_marker} {l.content}")
-                if l.recommendation:
-                    items.append(f"      → {l.recommendation}")
-
-            sections.append(f"{category_name}:\n" + "\n".join(items))
-
-        return "\n\n".join(sections)
+        except Exception as e:
+            logger.warning("Learning pruning error: %s", e)
 
     async def _llm_summarize(self, learnings_text: str) -> str:
         """Call LLM to generate preferences summary."""

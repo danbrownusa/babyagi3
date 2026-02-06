@@ -428,7 +428,21 @@ class TestLearning:
         )
         assert l.sentiment == "neutral"
         assert l.confidence == 0.5
-        assert l.category == "general"
+        assert l.tool_id is None
+        assert l.recommendation is None
+
+    def test_creation_with_tool(self):
+        l = Learning(
+            id="learn2",
+            source_type="tool_error_pattern",
+            content="Tool X has 40% success rate",
+            tool_id="tool_x",
+            sentiment="negative",
+            confidence=0.8,
+            recommendation="Validate parameters before use",
+        )
+        assert l.tool_id == "tool_x"
+        assert l.recommendation == "Validate parameters before use"
 
     def test_repr(self):
         l = Learning(

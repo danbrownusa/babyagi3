@@ -3802,7 +3802,12 @@ class MemoryStore:
     # ═══════════════════════════════════════════════════════════
 
     def create_learning(self, learning: Learning) -> Learning:
-        """Create a new learning from feedback or evaluation."""
+        """Create a new learning from feedback or evaluation.
+
+        Writes to the full DB schema for backward compatibility — unused
+        columns (category, applies_when, entity_ids, topic_ids,
+        times_applied, last_applied_at) get default/null values.
+        """
         cur = self.conn.cursor()
         now = now_iso()
 
@@ -3827,15 +3832,15 @@ class MemoryStore:
                 serialize_embedding(learning.content_embedding),
                 learning.sentiment,
                 learning.confidence,
-                learning.category,
+                "general",  # legacy column — no longer used for classification
                 learning.tool_id,
-                serialize_json(learning.topic_ids),
+                "[]",  # legacy column — topic_ids no longer tracked
                 learning.objective_type,
-                serialize_json(learning.entity_ids),
-                learning.applies_when,
+                "[]",  # legacy column — entity_ids no longer tracked
+                None,  # legacy column — applies_when folded into content
                 learning.recommendation,
-                learning.times_applied,
-                learning.last_applied_at.isoformat() if learning.last_applied_at else None,
+                0,  # legacy column — times_applied no longer tracked
+                None,  # legacy column — last_applied_at no longer tracked
                 now,
                 now,
             ),
@@ -3856,7 +3861,6 @@ class MemoryStore:
         objective_type: str | None = None,
         sentiment: str | None = None,
         source_type: str | None = None,
-        category: str | None = None,
         limit: int = 20,
     ) -> list[Learning]:
         """Find learnings by filters."""
@@ -3877,9 +3881,6 @@ class MemoryStore:
         if source_type:
             query += " AND source_type = ?"
             params.append(source_type)
-        if category:
-            query += " AND category = ?"
-            params.append(category)
 
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -3963,22 +3964,6 @@ class MemoryStore:
         )
         return [self._row_to_learning(row) for row in cur.fetchall()]
 
-    def record_learning_applied(self, learning_id: str):
-        """Record that a learning was used in context."""
-        cur = self.conn.cursor()
-        now = now_iso()
-        cur.execute(
-            """
-            UPDATE learnings
-            SET times_applied = times_applied + 1,
-                last_applied_at = ?,
-                updated_at = ?
-            WHERE id = ?
-        """,
-            (now, now, learning_id),
-        )
-        self.conn.commit()
-
     def delete_learning(self, learning_id: str) -> bool:
         """Delete a learning by ID."""
         cur = self.conn.cursor()
@@ -4032,13 +4017,12 @@ class MemoryStore:
         }
 
     def _row_to_learning(self, row: sqlite3.Row) -> Learning:
-        """Convert a database row to a Learning."""
-        # Handle databases created before the category column was added
-        try:
-            category = row["category"]
-        except (IndexError, KeyError):
-            category = "general"
+        """Convert a database row to a Learning.
 
+        Legacy columns (category, applies_when, entity_ids, topic_ids,
+        times_applied, last_applied_at) are read from DB but not mapped
+        to the simplified Learning model.
+        """
         return Learning(
             id=row["id"],
             source_type=row["source_type"],
@@ -4047,15 +4031,9 @@ class MemoryStore:
             content_embedding=deserialize_embedding(row["content_embedding"]),
             sentiment=row["sentiment"],
             confidence=row["confidence"],
-            category=category,
             tool_id=row["tool_id"],
-            topic_ids=deserialize_json(row["topic_ids"]) or [],
             objective_type=row["objective_type"],
-            entity_ids=deserialize_json(row["entity_ids"]) or [],
-            applies_when=row["applies_when"],
             recommendation=row["recommendation"],
-            times_applied=row["times_applied"],
-            last_applied_at=parse_datetime(row["last_applied_at"]),
             created_at=parse_datetime(row["created_at"]),
             updated_at=parse_datetime(row["updated_at"]),
         )
