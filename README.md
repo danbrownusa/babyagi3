@@ -24,14 +24,16 @@ Verbose mode is on by default — you'll see tool calls, webhook activity, and b
 
 ## Initialization
 
-On first run, BabyAGI walks you through an interactive setup wizard. It detects that no `~/.babyagi/initialized` marker exists and launches the onboarding flow before starting the agent.
+On first run, BabyAGI starts an LLM-powered setup conversation. It detects that no `~/.babyagi/initialized` marker exists and launches an interactive onboarding chat before starting the agent.
 
-### What the wizard covers
+The setup assistant has full context about how BabyAGI works — you can ask it questions ("what does AgentMail do?", "do I need SendBlue?", "how does memory work?") and provide your info in any order. It guides you conversationally and calls a `complete_initialization` tool when it has everything it needs.
 
-1. **System overview** — explains how BabyAGI works (channels, memory, scheduling)
-2. **Owner info** — collects your name, email, phone, and timezone so the agent can personalize responses and reach you
-3. **Email channel (AgentMail)** — walks you through entering your AgentMail API key and creates an inbox for the agent. Get a free key at [agentmail.to](https://agentmail.to).
-4. **SMS/iMessage channel (SendBlue)** — walks you through entering your SendBlue API key and secret so you can text your agent from your phone. Get credentials at [sendblue.co](https://sendblue.co).
+### What gets collected
+
+At minimum, the assistant needs your **name** and **email**. It will also walk you through setting up:
+
+- **Email channel ([AgentMail](https://agentmail.to))** — gives your agent its own email address for sending reports, handling signups, and email communication. Free tier available.
+- **SMS/iMessage channel ([SendBlue](https://sendblue.co))** — lets you text your agent from your phone. Needs an API key, secret, and your phone number.
 
 ### What gets set up automatically
 
