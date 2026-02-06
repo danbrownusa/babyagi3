@@ -865,7 +865,7 @@ def get_model_for_use_case(
             "research": "claude-sonnet-4-20250514",
             "agent": "claude-sonnet-4-20250514",
             "memory": "claude-sonnet-4-20250514",
-            "fast": "claude-3-5-haiku-20241022",
+            "fast": "claude-haiku-4-5-20251001",
         }
         return defaults.get(use_case, "claude-sonnet-4-20250514")
 
