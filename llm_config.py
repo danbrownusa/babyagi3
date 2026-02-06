@@ -109,7 +109,7 @@ def get_missing_config_message() -> str:
 ║    export ANTHROPIC_API_KEY="sk-ant-..."                                     ║
 ║                                                                              ║
 ║    Get your API key at: https://console.anthropic.com/                       ║
-║    Models used: claude-sonnet-4, claude-3-5-haiku                            ║
+║    Models used: claude-sonnet-4, claude-haiku-4.5                             ║
 ║                                                                              ║
 ║  Option 2: OpenAI (GPT)                                                      ║
 ║  ──────────────────────                                                      ║
@@ -151,8 +151,8 @@ ANTHROPIC_DEFAULTS = {
     "coding": "claude-sonnet-4-20250514",        # Best for code generation
     "research": "claude-sonnet-4-20250514",      # Good for research/analysis
     "agent": "claude-sonnet-4-20250514",         # Main agent operations
-    "memory": "claude-3-5-haiku-20241022",       # Memory extraction/summaries (Haiku: 3x cheaper, 2x faster, sufficient for structured extraction)
-    "fast": "claude-3-5-haiku-20241022",         # Quick/cheap operations
+    "memory": "claude-haiku-4-5-20251001",        # Memory extraction/summaries (Haiku 4.5: same price as 3.5, 2x faster, higher quality)
+    "fast": "claude-haiku-4-5-20251001",          # Quick/cheap operations
     "embedding": "local",                        # Use local embeddings (no API key required)
 }
 
