@@ -541,8 +541,9 @@ async def recall_status_webhook(
                     )
                     return
 
-                # Fetch transcript with retry — Recall.ai may still be processing
-                # the recording when 'done' fires, returning 400 temporarily.
+                # Fetch transcript with retry — the transcript download URL may
+                # not be available in bot_data immediately when 'done' fires.
+                # Re-fetch bot data on retry to get fresh media_shortcuts URLs.
                 transcript_data = None
                 max_retries = 3
                 for attempt in range(max_retries):
@@ -550,25 +551,27 @@ async def recall_status_webhook(
                         delay = 5 * (2 ** (attempt - 1))  # 5s, 10s
                         logger.info(f"Retrying transcript fetch for bot {bot_id} in {delay}s (attempt {attempt + 1}/{max_retries})")
                         await asyncio.sleep(delay)
+                        # Re-fetch bot data to get fresh media_shortcuts URLs
+                        bot_data = await client.get_bot(bot_id)
 
-                    transcript_data = await client.get_bot_transcript(bot_id)
+                    transcript_data = await client.get_bot_transcript(bot_id, bot_data=bot_data)
                     if "error" not in transcript_data:
                         break  # Success
 
                     status_code = transcript_data.get("status_code")
                     if status_code == 400 and attempt < max_retries - 1:
-                        # 400 likely means transcript not ready yet — retry
+                        # Transcript not ready yet — retry with fresh bot data
                         continue
                     elif status_code == 400:
-                        # Final attempt still 400 — likely a short meeting with
-                        # insufficient audio for transcription. Log as warning, not error.
+                        # Final attempt still no transcript — likely a short meeting
+                        # with insufficient audio for transcription.
                         logger.warning(
-                            f"Transcript unavailable for bot {bot_id} after {max_retries} attempts (HTTP 400). "
+                            f"Transcript unavailable for bot {bot_id} after {max_retries} attempts. "
                             f"This is expected for very short meetings. Detail: {transcript_data.get('detail', '')}"
                         )
                         return
                     else:
-                        # Non-400 error (e.g. 404, 500) — don't retry
+                        # Non-400 error — don't retry
                         logger.error(f"Failed to fetch transcript for bot {bot_id}: {transcript_data}")
                         return
 
