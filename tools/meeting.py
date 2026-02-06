@@ -308,29 +308,61 @@ class RecallClient:
             except Exception as e:
                 return {"error": str(e)}
 
-    async def get_bot_transcript(self, bot_id: str) -> dict:
-        """Get the transcript for a completed meeting."""
+    async def get_bot_transcript(self, bot_id: str, bot_data: dict = None) -> dict:
+        """Get the transcript for a completed meeting.
+
+        Uses the modern Recall.ai approach: fetch bot data, extract the
+        transcript download URL from recordings[].media_shortcuts.transcript,
+        and download the transcript from that pre-signed URL.
+
+        Args:
+            bot_id: The bot ID.
+            bot_data: Optional pre-fetched bot data (from get_bot()) to avoid
+                      a redundant API call.
+        """
         if not self.api_key:
             return {"error": "RECALL_API_KEY not configured"}
 
+        # Step 1: Get bot data if not provided
+        if bot_data is None:
+            bot_data = await self.get_bot(bot_id)
+            if "error" in bot_data:
+                return bot_data
+
+        # Step 2: Extract transcript download URL from recordings' media_shortcuts
+        recordings = bot_data.get("recordings", [])
+        download_url = None
+        for recording in recordings:
+            media_shortcuts = recording.get("media_shortcuts", {})
+            transcript_info = media_shortcuts.get("transcript", {})
+            data = transcript_info.get("data", {})
+            url = data.get("download_url")
+            if url:
+                download_url = url
+                break
+
+        if not download_url:
+            return {
+                "error": "Transcript not available yet",
+                "status_code": 400,
+                "detail": "No transcript download URL found in bot recordings. "
+                          "The transcript may still be processing.",
+            }
+
+        # Step 3: Download the transcript from the pre-signed URL
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(
-                    f"{self.base_url}/bot/{bot_id}/transcript/",
-                    headers=self._headers(),
-                    timeout=60.0,
-                )
+                response = await client.get(download_url, timeout=60.0)
 
                 if response.status_code == 200:
                     return response.json()
                 else:
-                    # Include response body for debugging
                     try:
                         body = response.text[:500]
                     except Exception:
                         body = ""
                     return {
-                        "error": f"API error {response.status_code}",
+                        "error": f"Transcript download failed (HTTP {response.status_code})",
                         "status_code": response.status_code,
                         "detail": body,
                     }
