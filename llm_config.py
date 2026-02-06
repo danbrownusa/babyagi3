@@ -109,7 +109,7 @@ def get_missing_config_message() -> str:
 ║    export ANTHROPIC_API_KEY="sk-ant-..."                                     ║
 ║                                                                              ║
 ║    Get your API key at: https://console.anthropic.com/                       ║
-║    Models used: claude-sonnet-4, claude-3-5-haiku                            ║
+║    Models used: claude-sonnet-4, claude-haiku-4.5                             ║
 ║                                                                              ║
 ║  Option 2: OpenAI (GPT)                                                      ║
 ║  ──────────────────────                                                      ║
@@ -151,8 +151,8 @@ ANTHROPIC_DEFAULTS = {
     "coding": "claude-sonnet-4-20250514",        # Best for code generation
     "research": "claude-sonnet-4-20250514",      # Good for research/analysis
     "agent": "claude-sonnet-4-20250514",         # Main agent operations
-    "memory": "claude-sonnet-4-20250514",        # Memory extraction/summaries
-    "fast": "claude-3-5-haiku-20241022",         # Quick/cheap operations
+    "memory": "claude-haiku-4-5-20251001",        # Memory extraction/summaries (Haiku 4.5: same price as 3.5, 2x faster, higher quality)
+    "fast": "claude-haiku-4-5-20251001",          # Quick/cheap operations
     "embedding": "local",                        # Use local embeddings (no API key required)
 }
 
@@ -233,7 +233,7 @@ class LLMConfig:
 
     memory_model: ModelConfig = field(default_factory=lambda: ModelConfig(
         model_id=ANTHROPIC_DEFAULTS["memory"],
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0.0,
     ))
 
@@ -261,7 +261,7 @@ class LLMConfig:
             coding_model=ModelConfig(model_id=defaults["coding"], max_tokens=8096),
             research_model=ModelConfig(model_id=defaults["research"], max_tokens=4096),
             agent_model=ModelConfig(model_id=defaults["agent"], max_tokens=8096),
-            memory_model=ModelConfig(model_id=defaults["memory"], max_tokens=2048),
+            memory_model=ModelConfig(model_id=defaults["memory"], max_tokens=4096),
             fast_model=ModelConfig(model_id=defaults["fast"], max_tokens=1024),
             embedding_model=defaults.get("embedding", "text-embedding-3-small"),
             embedding_provider=provider if provider != "none" else "local",
@@ -325,7 +325,7 @@ def create_default_config() -> LLMConfig:
         coding_model=ModelConfig(model_id=models["coding"], max_tokens=8096),
         research_model=ModelConfig(model_id=models["research"], max_tokens=4096),
         agent_model=ModelConfig(model_id=models["agent"], max_tokens=8096),
-        memory_model=ModelConfig(model_id=models["memory"], max_tokens=2048),
+        memory_model=ModelConfig(model_id=models["memory"], max_tokens=4096),
         fast_model=ModelConfig(model_id=models["fast"], max_tokens=1024),
         embedding_model=embedding_model,
         embedding_provider=provider if provider != "none" else "local",

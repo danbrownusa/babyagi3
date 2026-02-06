@@ -17,9 +17,12 @@ LLM_PRICING: dict[str, tuple[float, float]] = {
     # ─────────────────────────────────────────────────────────
     # Anthropic Claude
     # ─────────────────────────────────────────────────────────
-    # Claude 4
+    # Claude 4.5 / 4
+    "claude-sonnet-4-5-20250929": (3.00, 15.00),
     "claude-sonnet-4-20250514": (3.00, 15.00),
     "claude-opus-4-20250514": (15.00, 75.00),
+    # Claude Haiku 4.5 (same price as 3.5, 2x faster, higher quality)
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
     # Claude 3.5
     "claude-3-5-sonnet-20241022": (3.00, 15.00),
     "claude-3-5-haiku-20241022": (0.80, 4.00),
