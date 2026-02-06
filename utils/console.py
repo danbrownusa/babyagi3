@@ -272,8 +272,8 @@ class Console:
         """Log tool execution start."""
         self.verbose(f"[tool] {name}", VerboseLevel.LIGHT, "tool")
         if inputs and self._verbose_level >= VerboseLevel.DEEP:
-            # Truncate long values for readability
-            summary = self._summarize_dict(inputs)
+            safe_inputs = self._redact_dict(inputs, name)
+            summary = self._summarize_dict(safe_inputs)
             self.verbose(f"  input: {summary}", VerboseLevel.DEEP, "tool")
 
     def tool_end(self, name: str, result: Any = None, duration_ms: int = None):
@@ -281,7 +281,8 @@ class Console:
         timing = f" ({duration_ms}ms)" if duration_ms else ""
         self.verbose(f"[tool] {name} done{timing}", VerboseLevel.LIGHT, "tool")
         if result and self._verbose_level >= VerboseLevel.DEEP:
-            summary = self._summarize_value(result)
+            safe_result = self._redact_dict(result, name) if isinstance(result, dict) else result
+            summary = self._summarize_value(safe_result)
             self.verbose(f"  result: {summary}", VerboseLevel.DEEP, "tool")
 
     def objective_start(self, obj_id: str, goal: str):
@@ -325,6 +326,46 @@ class Console:
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
+
+    # Parameter names whose values are ALWAYS redacted in verbose output
+    _SENSITIVE_KEYS = frozenset({
+        "password", "secret", "api_key", "api_secret", "auth_token",
+        "token", "card_number", "card_cvv", "oauth_client_secret",
+        "access_token", "refresh_token", "private_key",
+    })
+
+    # Tools where the generic "value" parameter holds a secret
+    _SENSITIVE_VALUE_TOOLS = frozenset({
+        "store_secret",
+    })
+
+    def _redact_dict(self, d: dict, tool_name: str = None) -> dict:
+        """Return a shallow copy of d with sensitive values replaced by '***'.
+
+        Redaction rules:
+        - Keys in _SENSITIVE_KEYS are always redacted
+        - The 'value' key is redacted for tools in _SENSITIVE_VALUE_TOOLS
+        - Nested dicts are recursively redacted
+        """
+        if not isinstance(d, dict):
+            return d
+        redacted = {}
+        for k, v in d.items():
+            k_lower = k.lower()
+            if k_lower in self._SENSITIVE_KEYS:
+                redacted[k] = "***"
+            elif k_lower == "value" and tool_name in self._SENSITIVE_VALUE_TOOLS:
+                redacted[k] = "***"
+            elif isinstance(v, dict):
+                redacted[k] = self._redact_dict(v, tool_name)
+            elif isinstance(v, list):
+                redacted[k] = [
+                    self._redact_dict(item, tool_name) if isinstance(item, dict) else item
+                    for item in v
+                ]
+            else:
+                redacted[k] = v
+        return redacted
 
     def _summarize_dict(self, d: dict, max_len: int = 80) -> str:
         """Summarize a dict for display."""
