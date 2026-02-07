@@ -44,6 +44,12 @@ from scheduler import (
 from utils.events import EventEmitter
 from utils.console import console, VerboseLevel
 from utils.collections import ThreadSafeList
+from context_budget import (
+    ContextBudget,
+    truncate_tool_result,
+    summarize_tool_result,
+    SUMMARIZE_THRESHOLD_CHARS,
+)
 
 
 def json_serialize(obj):
@@ -280,6 +286,16 @@ class Agent(EventEmitter):
         # Tool context builder for intelligent tool selection
         self._tool_context_builder = self._initialize_tool_context()
         self._current_tool_selection = None  # Cached selection for current turn
+
+        # Context window budget management — prevents overflow
+        self._context_budget = ContextBudget()
+
+        # Cache of full (un-truncated) tool results, keyed by tool_use_id.
+        # Allows retrieval if the LLM needs details that were summarized away.
+        self._full_tool_results: dict[str, str] = {}
+
+        # Fast model for summarizing large tool results
+        self._summarizer_model = get_model_for_use_case("fast")
 
     def register_sender(self, channel: str, sender):
         """Register a channel sender for outbound messages.
@@ -870,13 +886,69 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
             system_prompt = self._system_prompt(thread_id, is_owner, context)
 
             while True:
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=8096,
-                    system=system_prompt,
-                    tools=self._tool_schemas(),
-                    messages=thread
-                )
+                # --- Pre-flight: trim thread to fit context budget ---
+                tool_schemas = self._tool_schemas()
+                thread = self._context_budget.trim_thread(thread, system_prompt, tool_schemas)
+                self.threads[thread_id] = thread  # Persist trimmed thread
+
+                # If thread budget is still tight, reduce tool schemas
+                if not self._context_budget.fits(system_prompt, tool_schemas, thread):
+                    tool_schemas = self._context_budget.reduce_tool_schemas(tool_schemas)
+                    thread = self._context_budget.trim_thread(thread, system_prompt, tool_schemas)
+                    self.threads[thread_id] = thread
+
+                # --- LLM call with context-overflow recovery ---
+                try:
+                    response = await self.client.messages.create(
+                        model=self.model,
+                        max_tokens=8096,
+                        system=system_prompt,
+                        tools=tool_schemas,
+                        messages=thread
+                    )
+                except Exception as e:
+                    if not self._is_context_overflow(e):
+                        raise
+                    # Stage 1 recovery: aggressive trim + reduced tools
+                    logger.warning("Context overflow detected, attempting recovery (stage 1)...")
+                    thread = self._context_budget.emergency_trim(thread)
+                    self.threads[thread_id] = thread
+                    tool_schemas = self._context_budget.reduce_tool_schemas(tool_schemas, max_count=15)
+                    try:
+                        response = await self.client.messages.create(
+                            model=self.model,
+                            max_tokens=8096,
+                            system=system_prompt,
+                            tools=tool_schemas,
+                            messages=thread
+                        )
+                    except Exception as e2:
+                        if not self._is_context_overflow(e2):
+                            raise
+                        # Stage 2 recovery: minimal thread + core tools only
+                        logger.warning("Context overflow persists, attempting recovery (stage 2)...")
+                        thread = thread[-2:] if len(thread) >= 2 else thread[-1:]
+                        self.threads[thread_id] = thread
+                        tool_schemas = self._context_budget.reduce_tool_schemas(tool_schemas, max_count=8)
+                        try:
+                            response = await self.client.messages.create(
+                                model=self.model,
+                                max_tokens=8096,
+                                system=system_prompt,
+                                tools=tool_schemas,
+                                messages=thread
+                            )
+                        except Exception as e3:
+                            if not self._is_context_overflow(e3):
+                                raise
+                            # Stage 3: give up gracefully — clear thread and inform user
+                            logger.error("Context overflow unrecoverable after 3 stages. Clearing thread.")
+                            self.threads[thread_id] = []
+                            return (
+                                "I ran into a context limit and couldn't recover automatically. "
+                                "I've cleared the conversation history so we can continue. "
+                                "Please repeat your request and I'll start fresh."
+                            )
 
                 # Track budget and tokens for objectives
                 if thread_id.startswith("objective_"):
@@ -950,6 +1022,21 @@ Work autonomously. Use tools as needed. When done, provide a brief summary of wh
                                 "error": f"Result serialization failed: {str(e)}",
                                 "original_type": type(result).__name__
                             })
+
+                        # --- Solution 1+5: Truncate / summarize large results ---
+                        if len(result_json) > SUMMARIZE_THRESHOLD_CHARS:
+                            # Store full result for later retrieval
+                            self._full_tool_results[block.id] = result_json
+
+                            # Try LLM summarization first, fall back to truncation
+                            summary = await summarize_tool_result(
+                                result_json, block.name,
+                                self.client, self._summarizer_model,
+                            )
+                            if summary is not None:
+                                result_json = summary
+                            else:
+                                result_json, _ = truncate_tool_result(result_json, block.name)
 
                         tool_results.append({
                             "type": "tool_result",
@@ -1571,11 +1658,16 @@ RESPONDING TO EXTERNAL REQUESTS:
 - Requests for owner info: Politely decline, offer to relay a message instead
 - Meeting/call requests: "I'll check my owner's availability and get back to you\""""
 
+    # Maximum tool schemas to send when smart selection is unavailable.
+    # Prevents Composio apps (86+ tools each) from blowing up the context.
+    MAX_FALLBACK_TOOL_SCHEMAS = 40
+
     def _tool_schemas(self) -> list:
         """Get tool schemas for API calls.
 
         Uses intelligent selection when ToolContextBuilder is available,
-        otherwise returns all tools. The selection prioritizes:
+        otherwise returns all tools (capped at MAX_FALLBACK_TOOL_SCHEMAS).
+        The selection prioritizes:
         1. Core tools (memory, objective, notes, schedule, etc.)
         2. Most frequently used tools
         3. Recently used tools
@@ -1591,8 +1683,28 @@ RESPONDING TO EXTERNAL REQUESTS:
                 for name, t in self.tools.items()
                 if name in self._current_tool_selection.selected_tools
             ]
-        # Fallback: all tools
-        return [t.schema for t in self.tools.values()]
+        # Fallback: all tools, but capped to prevent context blowup
+        all_schemas = [t.schema for t in self.tools.values()]
+        if len(all_schemas) > self.MAX_FALLBACK_TOOL_SCHEMAS:
+            logger.warning(
+                "Tool selection unavailable, capping %d tools to %d",
+                len(all_schemas), self.MAX_FALLBACK_TOOL_SCHEMAS,
+            )
+            return all_schemas[:self.MAX_FALLBACK_TOOL_SCHEMAS]
+        return all_schemas
+
+    @staticmethod
+    def _is_context_overflow(exc: Exception) -> bool:
+        """Check if an exception is a context window overflow error."""
+        msg = str(exc).lower()
+        return any(phrase in msg for phrase in (
+            "context_length_exceeded",
+            "context_window",
+            "maximum context length",
+            "token limit",
+            "request too large",
+            "prompt is too long",
+        ))
 
     def _extract_text(self, response) -> str:
         return "".join(b.text for b in response.content if hasattr(b, "text"))
