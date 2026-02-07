@@ -141,6 +141,11 @@ def main():
     if needs_initialization(config):
         run_initialization(config)
 
+    # Restore secrets from keyring into env vars so SDKs (Composio, etc.)
+    # can find keys that were stored during init or via store_secret.
+    from tools.secrets import load_keyring_secrets
+    load_keyring_secrets()
+
     if len(sys.argv) > 1:
         command = sys.argv[1]
 

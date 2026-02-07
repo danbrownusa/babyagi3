@@ -1396,7 +1396,7 @@ Configuration Updates (use update_config tool):
 - update_config(key, value) - Update any config value at runtime. Changes take effect immediately.
   Supported keys: OWNER_NAME, OWNER_EMAIL, OWNER_BIO, OWNER_GOAL, OWNER_PHONE, OWNER_TIMEZONE,
   AGENT_NAME, SENDBLUE_API_KEY, SENDBLUE_API_SECRET, SENDBLUE_PHONE_NUMBER,
-  AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID
+  AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID, COMPOSIO_API_KEY
 - Use this to update phone numbers, API keys, or owner info after initial setup
 - Example: update_config("SENDBLUE_PHONE_NUMBER", "+15551234567")
 - Example: update_config("OWNER_PHONE", "+15559876543")
