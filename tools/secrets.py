@@ -341,6 +341,8 @@ _CONFIG_FIELDS = {
     # Channel: Email (AgentMail)
     "AGENTMAIL_API_KEY": ("channels", "email", "api_key"),
     "AGENTMAIL_INBOX_ID": ("channels", "email", "inbox_id"),
+    # Composio integrations
+    "COMPOSIO_API_KEY": ("composio", "api_key"),
 }
 
 
@@ -365,6 +367,7 @@ def update_config(key: str, value: str, agent=None) -> dict:
       Agent:          AGENT_NAME
       SendBlue:       SENDBLUE_API_KEY, SENDBLUE_API_SECRET, SENDBLUE_PHONE_NUMBER
       AgentMail:      AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID
+      Composio:       COMPOSIO_API_KEY
 
     For API keys and secrets, this also persists the value to keyring storage
     (same as store_secret). For non-secret config (names, bios), it only sets
@@ -403,6 +406,7 @@ def update_config(key: str, value: str, agent=None) -> dict:
     secret_keys = {
         "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_PHONE_NUMBER",
         "AGENTMAIL_API_KEY", "AGENTMAIL_INBOX_ID",
+        "COMPOSIO_API_KEY",
     }
     persisted = False
     if key_upper in secret_keys:
@@ -438,3 +442,42 @@ def update_config(key: str, value: str, agent=None) -> dict:
         "config_updated": config_updated,
         "persisted_to_keyring": persisted,
     }
+
+
+# =============================================================================
+# Startup helper: restore keyring secrets into environment
+# =============================================================================
+
+# All keys that may be stored in keyring and should be loaded at startup.
+_KEYRING_KNOWN_KEYS = [
+    "AGENTMAIL_API_KEY",
+    "SENDBLUE_API_KEY",
+    "SENDBLUE_API_SECRET",
+    "COMPOSIO_API_KEY",
+]
+
+
+def load_keyring_secrets():
+    """Load secrets from keyring into environment variables at startup.
+
+    Called early in ``main.py`` so that keys persisted during initialization
+    (or via ``store_secret`` / ``update_config``) are available to SDKs like
+    Composio that read directly from ``os.environ``.
+
+    Only populates env vars that are not already set — explicit env vars,
+    ``.env`` files, and Replit secrets always take precedence.
+    """
+    keyring = _get_keyring()
+    if not keyring:
+        return
+
+    for key in _KEYRING_KNOWN_KEYS:
+        if os.environ.get(key):
+            continue  # already set — don't overwrite
+        try:
+            value = keyring.get_password(KEYRING_SERVICE, key)
+            if value:
+                os.environ[key] = value
+                logger.debug("Loaded %s from keyring", key)
+        except Exception as e:
+            logger.debug("Could not load %s from keyring: %s", key, e)

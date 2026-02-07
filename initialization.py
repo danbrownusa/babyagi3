@@ -407,6 +407,10 @@ _COMPLETE_INIT_TOOL = {
                     "If not provided, a new inbox will be auto-created when an API key is given."
                 ),
             },
+            "composio_api_key": {
+                "type": "string",
+                "description": "Composio API key for 250+ app integrations (Slack, GitHub, etc.). Get one at https://app.composio.dev",
+            },
         },
         "required": ["owner_name", "owner_email"],
     },
@@ -484,9 +488,10 @@ BabyAGI is a persistent AI agent that runs in the background and communicates th
    - Skill learning from SKILL.md files
    - 250+ app integrations via Composio
 
-4. CHANNELS WE RECOMMEND SETTING UP:
+4. CHANNELS AND INTEGRATIONS WE RECOMMEND SETTING UP:
    - AgentMail (email) - strongly recommended. Enables daily stats reports, email communication, and account management.
    - SendBlue (SMS/iMessage) - recommended if user has an iPhone or wants SMS access. Makes it easy to reach the agent from anywhere.
+   - Composio - optional but powerful. Connects the agent to 250+ apps (Slack, GitHub, Google Calendar, Notion, etc.). Get an API key at https://app.composio.dev
 
 WHAT YOU NEED TO COLLECT:
 Required:
@@ -510,6 +515,7 @@ Recommended:
   - Owner's phone number (needed for SMS to identify which messages are from the owner vs external senders)
 
 Optional:
+  - Composio API key (for 250+ app integrations like Slack, GitHub, Google Calendar - get at https://app.composio.dev)
   - Owner's timezone (for scheduling)
   - Agent name (defaults to "Assistant")
 
@@ -839,6 +845,8 @@ def _collect_keys_directly(result: dict) -> dict:
          "SendBlue API key (get one at https://sendblue.co)"),
         ("sendblue_api_secret", "SENDBLUE_API_SECRET",
          "SendBlue API secret"),
+        ("composio_api_key", "COMPOSIO_API_KEY",
+         "Composio API key (get one at https://app.composio.dev)"),
     ]
     # Non-secret fields (visible input)
     other_fields = [
@@ -971,11 +979,16 @@ def _apply_init_result(config: dict, result: dict):
         if result.get("sendblue_phone_number"):
             config["channels"]["sendblue"]["from_number"] = result["sendblue_phone_number"]
 
+    # Composio
+    if result.get("composio_api_key"):
+        os.environ["COMPOSIO_API_KEY"] = result["composio_api_key"]
+
     # Persist secrets to keyring for cross-restart persistence
     _keyring_map = {
         "agentmail_api_key": "AGENTMAIL_API_KEY",
         "sendblue_api_key": "SENDBLUE_API_KEY",
         "sendblue_api_secret": "SENDBLUE_API_SECRET",
+        "composio_api_key": "COMPOSIO_API_KEY",
     }
     for field, env_name in _keyring_map.items():
         val = result.get(field)
