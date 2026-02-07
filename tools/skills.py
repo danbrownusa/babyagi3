@@ -1189,12 +1189,17 @@ def _composio_setup_tool(agent: "Agent", Tool: type) -> "Tool":
                         "suggestion": f"Use: composio_setup(action='connect', app='{app}')"
                     }
 
-                # Get action schemas from Composio (use limit=500 to include
-                # read/list/get actions, not just the default subset)
+                # Get action schemas from Composio.
+                # When specific actions are requested, load exactly those.
+                # Otherwise load a capped set to avoid context window bloat
+                # (some apps like Attio have 86+ actions).
+                DEFAULT_COMPOSIO_ACTION_LIMIT = 20
                 if actions:
                     action_list = client.tools.get_raw_composio_tools(tools=actions)
                 else:
-                    action_list = client.tools.get_raw_composio_tools(toolkits=[app], limit=500)
+                    action_list = client.tools.get_raw_composio_tools(
+                        toolkits=[app], limit=DEFAULT_COMPOSIO_ACTION_LIMIT
+                    )
 
                 # Pre-populate the SDK's internal schema cache with all fetched tools.
                 # This is critical: tools.execute() needs the schema in _tool_schemas
@@ -1231,12 +1236,19 @@ def _composio_setup_tool(agent: "Agent", Tool: type) -> "Tool":
                     ag.tools[tool.name] = tool
                     registered.append(tool_name)
 
+                msg = f"Enabled {len(registered)} tools from {app}. You can now use these tools directly."
+                if not actions:
+                    msg += (
+                        f" (Loaded top {DEFAULT_COMPOSIO_ACTION_LIMIT} actions. "
+                        f"Use composio_setup(action='list_actions', app='{app}') to see all available, "
+                        f"then enable specific ones with actions=['ACTION_NAME'].)"
+                    )
                 return {
                     "success": True,
                     "app": app,
                     "registered": registered,
                     "count": len(registered),
-                    "message": f"Enabled {len(registered)} tools from {app}. You can now use these tools directly.",
+                    "message": msg,
                 }
             except Exception as e:
                 return {"error": f"Failed to enable {app} tools: {e}"}

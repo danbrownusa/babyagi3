@@ -144,8 +144,24 @@ Be concise. Mention what you can help with based on available tools. If any tool
                 )
                 console.agent(response)
             except Exception as e:
-                logger.exception(f"Error processing message: {e}")
-                console.system(f"Error: {e}")
+                # Check if this is a context overflow that escaped agent recovery
+                err_msg = str(e).lower()
+                is_context_error = any(p in err_msg for p in (
+                    "context_length_exceeded", "context_window",
+                    "maximum context length", "token limit",
+                    "request too large", "prompt is too long",
+                ))
+                if is_context_error:
+                    logger.warning("Context overflow reached CLI handler, clearing thread: %s", e)
+                    agent.clear_thread("main")
+                    console.system(
+                        "The conversation exceeded the context limit. "
+                        "I've cleared the history so we can continue. "
+                        "Please repeat your last request."
+                    )
+                else:
+                    logger.exception(f"Error processing message: {e}")
+                    console.system(f"Error: {e}")
 
         except EOFError:
             # Handle Ctrl+D
