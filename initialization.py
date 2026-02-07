@@ -34,6 +34,7 @@ Flow:
 Re-run setup anytime with: python main.py init
 """
 
+import getpass
 import os
 import re
 import sys
@@ -57,6 +58,22 @@ _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _BLUE = "\033[34m"
 _RESET = "\033[0m"
+
+# Keyring service name (must match tools/secrets.py)
+KEYRING_SERVICE = "babyagi"
+
+
+def _persist_to_keyring(env_name: str, value: str) -> bool:
+    """Persist a secret to keyring storage. Returns True on success."""
+    if not value:
+        return False
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE, env_name, value)
+        return True
+    except Exception as e:
+        logger.debug("Could not persist %s to keyring: %s", env_name, e)
+        return False
 
 
 # =============================================================================
@@ -150,6 +167,8 @@ def run_initialization(config: dict, force: bool = False) -> dict:
     result = _run_init_conversation(client, model, system_prompt, config)
 
     if result:
+        # Offer secure prompts for any API keys not already provided in chat
+        result = _collect_keys_directly(result)
         _apply_init_result(config, result)
         _save_init_state(result)
         _write_marker(result)
@@ -503,12 +522,14 @@ if SendBlue credentials are being set up. These are TWO DIFFERENT phone numbers:
 - Owner phone = the user's personal phone number (identifies their texts as owner)
 - SendBlue phone = the number assigned by SendBlue (the "from" number for sending texts)
 
-HOW API KEYS CAN BE PROVIDED (tell user if they ask):
-1. During this setup conversation (stored for current session)
+HOW API KEYS CAN BE PROVIDED (proactively mention the secure prompt; explain others if asked):
+1. **Recommended**: After this conversation, a secure prompt will ask for API keys.
+   Input is hidden (never echoed) and never sent to the AI. This is the most secure option during setup.
 2. In a .env file in the project root (persists across restarts)
 3. As environment variables (e.g., export SENDBLUE_API_KEY="...")
 4. In Replit secrets (if running on Replit)
 5. After setup, by telling the agent: "set SENDBLUE_PHONE_NUMBER to +1555..."
+6. During this chat (works but the key passes through the LLM API; use the secure prompt instead if possible)
 {existing_section}
 YOUR BEHAVIOR:
 - Start by briefly introducing yourself and explaining you'll help set up BabyAGI
@@ -540,12 +561,18 @@ The user can always reconfigure later by:
 - Re-running setup with: python main.py init
 
 IMPORTANT - HOW API KEYS ARE STORED:
-When the user provides API keys or phone numbers during this setup conversation, they are:
+When the user provides API keys during this conversation OR at the secure prompt afterwards, they are:
 1. Set as environment variables for the current session (immediate use)
 2. Written to the in-memory config (so all channels start correctly)
-They are NOT stored in keyring/"Replit secrets". If the user wants persistence across restarts,
-they should set these in their .env file, environment variables, or Replit secrets.
-After setup, the agent has an update_config tool that can update any of these values at runtime."""
+3. Persisted to keyring storage (so they survive restarts)
+After setup, the agent has an update_config tool that can update any of these values at runtime.
+
+IMPORTANT - TELL THE USER ABOUT THE SECURE PROMPT:
+Let the user know that after this conversation finishes, they will be given a secure prompt
+to enter API keys. At that prompt their input is hidden and never sent to the AI.
+If they prefer, they can still paste keys directly in this chat — those will work too
+and will be persisted to keyring. But the secure prompt is the recommended approach.
+Do NOT pressure the user for API keys during the conversation — just mention the secure prompt."""
 
 
 # =============================================================================
@@ -796,6 +823,86 @@ def _detect_existing_config(config: dict) -> dict:
     }
 
 
+def _collect_keys_directly(result: dict) -> dict:
+    """Prompt for API keys securely after the LLM conversation.
+
+    Uses ``getpass`` so input is never echoed and never sent to the LLM.
+    Keys already provided during the chat conversation are skipped.
+    Logging is temporarily suppressed to prevent background output from
+    interfering with the hidden input prompts.
+    """
+    # Fields that are secrets (hidden input via getpass)
+    secret_fields = [
+        ("agentmail_api_key", "AGENTMAIL_API_KEY",
+         "AgentMail API key (get one at https://agentmail.to)"),
+        ("sendblue_api_key", "SENDBLUE_API_KEY",
+         "SendBlue API key (get one at https://sendblue.co)"),
+        ("sendblue_api_secret", "SENDBLUE_API_SECRET",
+         "SendBlue API secret"),
+    ]
+    # Non-secret fields (visible input)
+    other_fields = [
+        ("sendblue_phone_number", "SENDBLUE_PHONE_NUMBER",
+         "SendBlue phone number (your assigned 'from' number)"),
+        ("agentmail_inbox_id", "AGENTMAIL_INBOX_ID",
+         "AgentMail inbox ID (if you already have one)"),
+    ]
+
+    # Determine which fields still need values
+    needed_secrets = [
+        (f, env, label) for f, env, label in secret_fields
+        if not result.get(f) and not os.environ.get(env)
+    ]
+    needed_other = [
+        (f, env, label) for f, env, label in other_fields
+        if not result.get(f) and not os.environ.get(env)
+    ]
+
+    if not needed_secrets and not needed_other:
+        return result
+
+    # --- header ---
+    print(f"\n  {_BOLD}Secure API Key Setup{_RESET}")
+    print(f"  {_DIM}Your input below is hidden and never sent to the AI.{_RESET}")
+    print(f"  {_DIM}Press Enter to skip any key you don't have yet.{_RESET}")
+    print()
+    print(f"  {_DIM}You can also provide keys later via:{_RESET}")
+    print(f"  {_DIM}  - .env file in the project root{_RESET}")
+    print(f"  {_DIM}  - Environment variables (export KEY=\"...\"){_RESET}")
+    print(f"  {_DIM}  - Replit secrets (if on Replit){_RESET}")
+    print(f"  {_DIM}  - Telling the agent: \"set SENDBLUE_API_KEY to ...\"{_RESET}")
+    print()
+
+    # Suppress all logging while prompting so background output doesn't
+    # interfere with the (invisible) user input.
+    prev_level = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        # Collect secrets (hidden)
+        for field, _env, label in needed_secrets:
+            try:
+                value = getpass.getpass(f"  {label}: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if value.strip():
+                result[field] = value.strip()
+
+        # Collect non-secrets (visible)
+        for field, _env, label in needed_other:
+            try:
+                value = input(f"  {label}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if value:
+                result[field] = value
+    finally:
+        logging.disable(prev_level)
+
+    return result
+
+
 def _apply_init_result(config: dict, result: dict):
     """Apply the initialization result to config and environment."""
     # Owner config
@@ -863,6 +970,17 @@ def _apply_init_result(config: dict, result: dict):
         config["channels"]["sendblue"]["enabled"] = True
         if result.get("sendblue_phone_number"):
             config["channels"]["sendblue"]["from_number"] = result["sendblue_phone_number"]
+
+    # Persist secrets to keyring for cross-restart persistence
+    _keyring_map = {
+        "agentmail_api_key": "AGENTMAIL_API_KEY",
+        "sendblue_api_key": "SENDBLUE_API_KEY",
+        "sendblue_api_secret": "SENDBLUE_API_SECRET",
+    }
+    for field, env_name in _keyring_map.items():
+        val = result.get(field)
+        if val:
+            _persist_to_keyring(env_name, val)
 
 
 # =============================================================================
